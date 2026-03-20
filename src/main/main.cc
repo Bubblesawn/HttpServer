@@ -4,9 +4,24 @@
 #include <getopt.h>
 #include "../server/http_server.h"
 
+/**
+ * @brief 全局服务器实例指针
+ * 
+ * 用于在信号处理函数中访问服务器实例以便优雅地关闭服务器。
+ * 由于信号处理函数不能使用类的成员函数，使用全局指针是必要的解决方案。
+ */
 static HttpServer* g_server = nullptr;
 
+/**
+ * @brief 信号处理函数
+ * 
+ * 捕获 SIGINT（Ctrl+C）和 SIGTERM（终止信号）信号，
+ * 执行服务器的优雅关闭操作。
+ * 
+ * @param signum 信号编号
+ */
 void signalHandler(int signum) {
+    // 处理 SIGINT(用户按 Ctrl+C)  和 SIGTERM(用户输入kill) 信号
     if (signum == SIGINT || signum == SIGTERM) {
         std::cout << "\nShutting down server..." << std::endl;
         if (g_server) {
@@ -16,25 +31,69 @@ void signalHandler(int signum) {
     }
 }
 
+/**
+ * @brief 打印程序使用说明
+ * 
+ * 显示所有可用的命令行选项及其说明。
+ * 
+ * @param programName 程序名称（通常为 argv[0]）
+ */
 void printUsage(const char* programName) {
     std::cout << "Usage: " << programName << " [OPTIONS]\n"
               << "Options:\n"
               << "  -p, --port PORT        Server port (default: 8080)\n"
               << "  -d, --doc-root DIR     Document root directory (default: ./html_docs)\n"
               << "  -t, --threads NUM      Number of threads (default: 4)\n"
-              << "  -h, --help            Show this help message\n"
-              << "  -v, --version         Show version information\n";
+              << "  -h, --help             Show this help message\n"
+              << "  -v, --version          Show version information\n";
 }
 
+/**
+ * @brief 打印程序版本信息
+ * 
+ * 显示当前HTTP服务器的版本号。
+ */
 void printVersion() {
     std::cout << "CppHttpServer version 1.0.0\n";
 }
 
+/**
+ * @brief 主函数 - HTTP服务器程序入口
+ * 
+ * 解析命令行参数，初始化并启动HTTP服务器。
+ * 支持通过命令行选项配置服务器端口、文档根目录和线程池大小。
+ * 
+ * @param argc 命令行参数个数
+ * @param argv 命令行参数数组
+ * @return int 程序返回码（0表示正常退出，非0表示错误）
+ * 
+ * 命令行选项说明：
+ *   -p, --port:      指定服务器监听端口（默认8080）
+ *   -d, --doc-root: 指定文档根目录（默认./html_docs）
+ *   -t, --threads:  指定线程池线程数量（默认4）
+ *   -h, --help:     显示帮助信息
+ *   -v, --version:  显示版本信息
+ * 
+ * 示例用法：
+ *   ./http_server -p 8080 -d /var/www/html -t 8
+ *   ./http_server --port=9000 --doc-root=/home/user/www
+ */
 int main(int argc, char* argv[]) {
-    int port = 8080;
-    std::string docRoot = "./html_docs";
-    int numThreads = 4;
+    /** 默认配置值 */
+    int port = 8080;           /**< 服务器监听端口 */
+    std::string docRoot = "./html_docs";  /**< 文档根目录 */
+    int numThreads = 4;        /**< 线程池线程数量 */
 
+    /**
+     * 命令行选项定义数组
+     * 使用 getopt_long 标准库函数解析长选项和短选项
+     * 
+     * 结构体说明：
+     *   name:       长选项名称
+     *   has_arg:    是否需要参数（no_argument=0, required_argument=1, optional_argument=2）
+     *   flag:       如果为nullptr，则返回val作为返回值；否则将*flag设为val并返回0
+     *   val:        短选项字符或用于返回的长选项标识
+     */
     static struct option longOptions[] = {
         {"port", required_argument, 0, 'p'},
         {"doc-root", required_argument, 0, 'd'},
@@ -44,59 +103,119 @@ int main(int argc, char* argv[]) {
         {0, 0, 0, 0}
     };
 
-    int optionIndex = 0;
-    int c;
+    int optionIndex = 0;  /**< 指向当前解析选项的索引 */
+    int c;                /**< getopt_long 返回的字符 */
 
+    /**
+     * 解析命令行参数循环
+     * getopt_long 会依次处理每个选项：
+     *   - 短选项（如 -p）
+     *   - 长选项（如 --port）
+     *   - 带参数的选项（如 -p 8080 或 --port=8080）
+     * 
+     * 返回值说明：
+     *   - 字符: 成功解析一个选项
+     *   - -1:   所有选项已解析完毕
+     *   - '?':  遇到未知选项或缺少必需参数
+     */
     while ((c = getopt_long(argc, argv, "p:d:t:hv", longOptions, &optionIndex)) != -1) {
         switch (c) {
             case 'p':
+                /** 解析端口参数 */
                 port = std::atoi(optarg);
+                /** 端口号有效性验证：必须在1-65535范围内 */
                 if (port <= 0 || port > 65535) {
                     std::cerr << "Invalid port number: " << optarg << std::endl;
                     return 1;
                 }
                 break;
             case 'd':
+                /** 设置文档根目录 */
                 docRoot = optarg;
                 break;
             case 't':
+                /** 解析线程数量参数 */
                 numThreads = std::atoi(optarg);
+                /** 线程数必须大于0 */
                 if (numThreads <= 0) {
                     std::cerr << "Invalid thread number: " << optarg << std::endl;
                     return 1;
                 }
                 break;
             case 'h':
+                /** 显示帮助信息 */
                 printUsage(argv[0]);
                 return 0;
             case 'v':
+                /** 显示版本信息 */
                 printVersion();
                 return 0;
             default:
+                /** 未知选项，显示用法并退出 */
                 printUsage(argv[0]);
                 return 1;
         }
     }
 
+    /**
+     * @brief 设置标准输出/错误流为无缓冲模式
+     * 
+     * setvbuf() 用于控制缓冲行为：
+     *   - _IONBF: 无缓冲模式（No Buffering）
+     * 
+     * 为什么要使用无缓冲：
+     *   - 确保日志和消息立即输出到控制台
+     *   - 避免在服务器日志中丢失重要信息
+     *   - 便于调试和实时监控服务器状态
+     */
     setvbuf(stdout, NULL, _IONBF, 0);
     setvbuf(stderr, NULL, _IONBF, 0);
 
+    /**
+     * @brief 注册信号处理函数
+     * 
+     * 设置对 SIGINT 和 SIGTERM 信号的处理：
+     *   - SIGINT (Ctrl+C): 用户主动中断服务器
+     *   - SIGTERM: 系统发送的终止请求
+     * 
+     * 这样做可以确保服务器优雅关闭：
+     *   - 停止接受新连接
+     *   - 等待正在处理的请求完成
+     *   - 释放资源（如关闭线程池、socket等）
+     */
     signal(SIGINT, signalHandler);
     signal(SIGTERM, signalHandler);
 
+    /** 创建HTTP服务器实例，监听所有网络接口 */
     HttpServer server("0.0.0.0", port);
+    
+    /** 配置服务器文档根目录 */
     server.setDocRoot(docRoot);
+    
+    /** 配置线程池大小 */
     server.setNumThreads(numThreads);
 
+    /** 保存全局指针以便信号处理函数使用 */
     g_server = &server;
 
+    /** 启动服务器并检查启动结果 */
     if (!server.start()) {
         std::cerr << "Failed to start server" << std::endl;
         return 1;
     }
 
+    /** 服务器启动成功，输出提示信息 */
     std::cout << "Server is running. Press Ctrl+C to stop." << std::endl;
 
+    /**
+     * @brief 主循环 - 保持服务器运行
+     * 
+     * 使用原子变量检查服务器运行状态，
+     * 每秒检查一次以便响应关闭请求。
+     * 
+     * 注意：实际处理请求的工作在线程池中异步进行，
+     * 这个主循环主要用于保持主线程存活。
+     */
     while (server.isRunning()) {
         std::this_thread::sleep_for(std::chrono::seconds(1));
     }

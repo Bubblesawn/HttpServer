@@ -1,68 +1,128 @@
+/**
+ * @file http_server.cc
+ * @brief HTTP服务器类的实现文件
+ * 
+ * 实现HttpServer类中声明的所有方法，
+ * 包括服务器启动、停止、请求处理、静态文件服务等功能。
+ */
+
 #include "../server/http_server.h"
 #include "../request/http_request.h"
 #include "../response/http_response.h"
 #include "../thread/thread_pool.h"
 
-#include <sys/socket.h>
-#include <sys/types.h>
-#include <sys/stat.h>
-#include <netinet/in.h>
-#include <arpa/inet.h>
-#include <unistd.h>
-#include <fcntl.h>
-#include <signal.h>
-#include <dirent.h>
-#include <cstring>
-#include <cerrno>
-#include <fstream>
-#include <sstream>
-#include <algorithm>
-#include <cctype>
-#include <iostream>
+// POSIX网络编程头文件
+#include <sys/socket.h>      // socket编程接口
+#include <sys/types.h>       // 数据类型定义
+#include <sys/stat.h>        // 文件状态
+#include <netinet/in.h>     // 网络地址结构
+#include <arpa/inet.h>      // IP地址转换
+#include <unistd.h>          // POSIX API (close, read, write等)
+#include <fcntl.h>           // 文件控制
+#include <signal.h>          // 信号处理
+#include <dirent.h>         // 目录操作
+#include <cstring>           // C字符串处理
+#include <cerrno>           // 错误处理
+#include <fstream>           // 文件流
+#include <sstream>           // 字符串流
+#include <algorithm>         // 算法
+#include <cctype>           // 字符处理
+#include <iostream>          // 输入输出
 
+/**
+ * @brief 构造函数
+ * 
+ * 初始化HttpServer对象，设置默认配置。
+ * 
+ * @param ip 服务器绑定的IP地址（默认"0.0.0.0"）
+ * @param port 服务器监听端口（默认8080）
+ */
 HttpServer::HttpServer(const std::string& ip, int port)
     : m_ip(ip)
     , m_port(port)
-    , m_docRoot("./html_docs")
-    , m_numThreads(4)
-    , m_serverSocket(-1)
-    , m_running(false) {
+    , m_docRoot("./html_docs")    // 默认文档根目录
+    , m_numThreads(4)             // 默认4个工作线程
+    , m_serverSocket(-1)         // 初始化为无效socket
+    , m_running(false) {          // 初始状态为未运行
+    /**
+     * @brief 忽略SIGPIPE信号
+     * 
+     * 当向已关闭的socket写入数据时，进程会收到SIGPIPE信号并终止。
+     * 忽略该信号可以防止这种情况，让write返回错误码而不是终止进程。
+     * 
+     * 常见场景：客户端提前关闭连接，但服务器仍在发送数据
+     */
     signal(SIGPIPE, SIG_IGN);
 }
 
+/**
+ * @brief 析构函数
+ * 
+ * 确保服务器被正确停止，释放所有资源。
+ */
 HttpServer::~HttpServer() {
-    stop();
+    stop();  // 调用stop确保资源释放
 }
 
+/**
+ * @brief 启动HTTP服务器
+ * 
+ * 执行以下步骤：
+ * 1. 检查服务器是否已在运行
+ * 2. 创建服务器socket
+ * 3. 设置socket选项（地址重用）
+ * 4. 绑定地址和端口
+ * 5. 开始监听连接
+ * 6. 初始化线程池
+ * 
+ * @return bool 启动成功返回true，失败返回false
+ */
 bool HttpServer::start() {
+    // 检查服务器是否已在运行
     if (m_running.load()) {
         return false;
     }
 
+    // 创建TCP socket
+    // AF_INET: IPv4协议
+    // SOCK_STREAM: 面向连接的可靠数据传输（TCP）
     m_serverSocket = socket(AF_INET, SOCK_STREAM, 0);
     if (m_serverSocket < 0) {
-        perror("socket");
+        perror("socket");  // 输出错误信息到stderr
         return false;
     }
 
+    /**
+     * @brief 设置socket选项 - 地址重用
+     * 
+     * SO_REUSEADDR允许在服务器关闭后立即重新绑定到相同端口，
+     * 而不需要等待操作系统释放端口（通常有TIME_WAIT状态）。
+     * 
+     * 这在开发调试时特别有用，可以快速重启服务器。
+     */
     int opt = 1;
     if (setsockopt(m_serverSocket, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt)) < 0) {
         perror("setsockopt(SO_REUSEADDR)");
     }
 
+    // 准备服务器地址结构
     struct sockaddr_in serverAddr;
-    memset(&serverAddr, 0, sizeof(serverAddr));
-    serverAddr.sin_family = AF_INET;
-    serverAddr.sin_port = htons(m_port);
-    serverAddr.sin_addr.s_addr = inet_addr(m_ip.c_str());
+    memset(&serverAddr, 0, sizeof(serverAddr));  // 清零结构体
+    
+    serverAddr.sin_family = AF_INET;                    // IPv4
+    serverAddr.sin_port = htons(m_port);               // 端口号（主机字节序转网络字节序）
+    serverAddr.sin_addr.s_addr = inet_addr(m_ip.c_str());  // IP地址
 
+    // 绑定地址和端口到socket
     if (bind(m_serverSocket, (struct sockaddr*)&serverAddr, sizeof(serverAddr)) < 0) {
         perror("bind");
-        close(m_serverSocket);
+        close(m_serverSocket);      // 绑定失败，关闭socket
         m_serverSocket = -1;
         return false;
     }
 
+    // 开始监听连接请求
+    // 128: 等待队列的最大长度
     if (listen(m_serverSocket, 128) < 0) {
         perror("listen");
         close(m_serverSocket);
@@ -70,9 +130,13 @@ bool HttpServer::start() {
         return false;
     }
 
+    // 设置服务器为运行状态
     m_running.store(true);
+    
+    // 创建线程池
     m_threadPool = std::make_unique<ThreadPool>(m_numThreads);
 
+    // 输出启动信息
     std::cout << "Server started on " << m_ip << ":" << m_port << std::endl;
     std::cout << "Document root: " << m_docRoot << std::endl;
     std::cout << "Thread pool size: " << m_numThreads << std::endl;
@@ -80,96 +144,210 @@ bool HttpServer::start() {
     return true;
 }
 
+/**
+ * @brief 停止HTTP服务器
+ * 
+ * 优雅停止服务器：
+ * 1. 设置停止标志
+ * 2. 关闭服务器socket（停止接受新连接）
+ * 3. 关闭线程池（等待所有任务完成）
+ * 
+ * 注意：已建立的连接将继续处理直到完成
+ */
 void HttpServer::stop() {
+    // 检查服务器是否在运行
     if (!m_running.load()) {
         return;
     }
 
+    // 设置停止标志
     m_running.store(false);
 
+    // 关闭服务器socket，停止接受新连接
     if (m_serverSocket >= 0) {
         close(m_serverSocket);
         m_serverSocket = -1;
     }
 
+    // 关闭线程池，等待所有任务完成
     if (m_threadPool) {
         m_threadPool->shutdown();
-        m_threadPool.reset();
+        m_threadPool.reset();  // 释放智能指针
     }
 
     std::cout << "Server stopped" << std::endl;
 }
 
+/**
+ * @brief 检查服务器是否正在运行
+ * 
+ * @return bool 运行返回true，否则返回false
+ */
 bool HttpServer::isRunning() const {
     return m_running.load();
 }
 
+/**
+ * @brief 设置服务器端口
+ * 
+ * @param port 端口号
+ */
 void HttpServer::setPort(int port) {
     m_port = port;
 }
 
+/**
+ * @brief 获取服务器端口
+ * 
+ * @return int 当前端口号
+ */
 int HttpServer::getPort() const {
     return m_port;
 }
 
+/**
+ * @brief 设置文档根目录
+ * 
+ * @param docRoot 目录路径
+ */
 void HttpServer::setDocRoot(const std::string& docRoot) {
     m_docRoot = docRoot;
 }
 
+/**
+ * @brief 获取文档根目录
+ * 
+ * @return std::string 文档根目录
+ */
 std::string HttpServer::getDocRoot() const {
     return m_docRoot;
 }
 
+/**
+ * @brief 设置线程池大小
+ * 
+ * @param numThreads 线程数量
+ */
 void HttpServer::setNumThreads(int numThreads) {
     m_numThreads = numThreads;
 }
 
+/**
+ * @brief 获取线程池大小
+ * 
+ * @return int 线程数量
+ */
 int HttpServer::getNumThreads() const {
     return m_numThreads;
 }
 
+/**
+ * @brief 设置自定义请求处理函数
+ * 
+ * @param handler 请求处理函数
+ */
 void HttpServer::setRequestHandler(RequestHandler handler) {
     m_requestHandler = handler;
 }
 
+/**
+ * @brief 获取本地IP地址
+ * 
+ * 通过getsockname获取服务器绑定的实际IP地址。
+ * 
+ * @return std::string IP地址字符串
+ */
 std::string HttpServer::getLocalIp() const {
-    char ip[INET_ADDRSTRLEN];
+    char ip[INET_ADDRSTRLEN];  // INET_ADDRSTRLEN (16) 足够存储IPv4地址字符串
     struct sockaddr_in addr;
     socklen_t addrLen = sizeof(addr);
+    
+    // 获取socket绑定的地址信息
     if (getsockname(m_serverSocket, (struct sockaddr*)&addr, &addrLen) == 0) {
+        // 将网络字节序的IP地址转换为字符串格式
         inet_ntop(AF_INET, &addr.sin_addr, ip, sizeof(ip));
         return std::string(ip);
     }
-    return "0.0.0.0";
+    
+    return "0.0.0.0";  // 出错时返回默认值
 }
 
+/**
+ * @brief 接受客户端连接
+ * 
+ * 在独立线程中运行，持续接受新的客户端连接。
+ * 每个新连接被包装成任务提交到线程池。
+ * 
+ * 工作流程：
+ * 1. 等待客户端连接（accept阻塞）
+ * 2. 获取客户端地址信息
+ * 3. 将处理任务提交到线程池
+ * 4. 继续等待下一个连接
+ */
 void HttpServer::acceptConnections() {
+    // 持续接受连接直到服务器停止
     while (m_running.load()) {
         struct sockaddr_in clientAddr;
         socklen_t clientAddrLen = sizeof(clientAddr);
 
-        int clientSocket = accept(m_serverSocket, (struct sockaddr*)&clientAddr, &clientAddrLen);
+        /**
+         * @brief 接受客户端连接
+         * 
+         * accept()会阻塞直到有客户端连接到来。
+         * 成功时返回一个新的socket描述符用于与该客户端通信。
+         * 
+         * @note 这里的clientSocket是独立的，与m_serverSocket不同
+         */
+        int clientSocket = accept(m_serverSocket, 
+                                 (struct sockaddr*)&clientAddr, 
+                                 &clientAddrLen);
+        
         if (clientSocket < 0) {
+            // 被中断信号打断，继续等待
             if (errno == EINTR) {
                 continue;
             }
             perror("accept");
-            break;
+            break;  // 其他错误，退出循环
         }
 
+        // 获取客户端IP地址和端口
         char clientIp[INET_ADDRSTRLEN];
         inet_ntop(AF_INET, &clientAddr.sin_addr, clientIp, sizeof(clientIp));
-        int clientPort = ntohs(clientAddr.sin_port);
+        int clientPort = ntohs(clientAddr.sin_port);  // 网络字节序转主机字节序
 
         std::cout << "Client connected: " << clientIp << ":" << clientPort << std::endl;
 
+        /**
+         * @brief 将客户端处理任务加入线程池
+         * 
+         * 使用lambda表达式捕获this指针和参数，
+         * 将处理任务提交到线程池的工作队列。
+         * 
+         * 线程池会自动分配空闲线程来执行这个任务。
+         */
         m_threadPool->enqueue([this, clientSocket, clientIp, clientPort]() {
             handleClient(clientSocket, clientIp, clientPort);
         });
     }
 }
 
+/**
+ * @brief 处理客户端请求
+ * 
+ * 完整的请求处理流程：
+ * 1. 解析HTTP请求
+ * 2. 调用处理函数生成响应
+ * 3. 发送响应头
+ * 4. 发送响应体（文件或内存内容）
+ * 5. 关闭客户端连接
+ * 
+ * @param clientSocket 客户端socket描述符
+ * @param clientIp 客户端IP地址
+ * @param clientPort 客户端端口号
+ */
 void HttpServer::handleClient(int clientSocket, const std::string& clientIp, int clientPort) {
+    // 初始化请求和响应对象
     HttpRequest request;
     request.setClientIp(clientIp);
     request.setClientPort(clientPort);
@@ -177,67 +355,106 @@ void HttpServer::handleClient(int clientSocket, const std::string& clientIp, int
     HttpResponse response;
 
     try {
+        // 步骤1：解析HTTP请求
         request = parseRequest(clientSocket);
 
+        // 步骤2：根据请求类型调用相应处理函数
         if (m_requestHandler) {
+            // 使用自定义处理函数
             response = m_requestHandler(request);
         } else {
+            // 默认处理：GET请求提供静态文件服务
             if (request.getMethod() == HttpRequest::METHOD_GET) {
                 response = handleStaticFile(request);
             } else {
+                // 其他HTTP方法返回501 Not Implemented
                 response = HttpResponse::notImplemented();
             }
         }
     } catch (const std::exception& e) {
+        // 捕获异常并返回500错误
         std::cerr << "Request handling exception: " << e.what() << std::endl;
         response = HttpResponse::internalServerError();
     }
 
+    // 步骤3：发送HTTP响应
+    // 将响应对象转换为字符串格式（HTTP头）
     std::string responseStr = response.toString();
     sendData(clientSocket, responseStr.c_str(), responseStr.size());
 
+    // 步骤4：发送响应体
     if (!response.getFilePath().empty() && response.getStatusCode() == HttpResponse::STATUS_200_OK) {
+        // 发送文件内容
         int fileFd = open(response.getFilePath().c_str(), O_RDONLY);
         if (fileFd >= 0) {
-            char buffer[8192];
+            char buffer[8192];  // 8KB读取缓冲区
             ssize_t bytesRead;
+            
+            // 分块读取文件并发送
             while ((bytesRead = read(fileFd, buffer, sizeof(buffer))) > 0) {
                 sendData(clientSocket, buffer, bytesRead);
             }
             close(fileFd);
         }
     } else if (!response.getBody().empty()) {
+        // 发送内存中的响应体
         sendData(clientSocket, response.getBody().c_str(), response.getBody().size());
     }
 
+    // 步骤5：关闭客户端连接
     close(clientSocket);
 }
 
+/**
+ * @brief 解析HTTP请求
+ * 
+ * 从socket读取并解析HTTP请求行和头部，
+ * 构造HttpRequest对象。
+ * 
+ * HTTP请求格式：
+ * @code
+ * GET /path HTTP/1.1\r\n
+ * Host: example.com\r\n
+ * Content-Type: text/html\r\n
+ * \r\n
+ * [body]
+ * @endcode
+ * 
+ * @param clientSocket 客户端socket
+ * @return HttpRequest 解析后的请求对象
+ */
 HttpRequest HttpServer::parseRequest(int clientSocket) const {
     HttpRequest request;
     std::string line;
 
+    // 读取请求行（第一行）
     if (readLine(clientSocket, line) <= 0) {
         return request;
     }
 
+    // 解析请求行：METHOD URL HTTP/VERSION
     std::istringstream requestLine(line);
     std::string method, url, version;
     requestLine >> method >> url >> version;
 
+    // 设置请求方法和URL
     request.setMethodString(method);
     request.setUrl(url);
 
+    // 读取HTTP头部
     while (readLine(clientSocket, line) > 0) {
+        // 空行表示头部结束
         if (line.empty()) {
             break;
         }
 
+        // 解析头部字段：Key: Value
         size_t colonPos = line.find(':');
         if (colonPos != std::string::npos) {
             std::string key = line.substr(0, colonPos);
             std::string value = line.substr(colonPos + 1);
 
+            // 去除首尾空白
             value.erase(0, value.find_first_not_of(" \t"));
             value.erase(value.find_last_not_of(" \t") + 1);
 
@@ -245,9 +462,13 @@ HttpRequest HttpServer::parseRequest(int clientSocket) const {
         }
     }
 
+    // 读取请求体（如果存在）
     std::string contentLengthStr = request.getHeader("Content-Length");
     if (!contentLengthStr.empty()) {
+        // 解析Content-Length获取请求体大小
         size_t contentLength = std::stoul(contentLengthStr);
+        
+        // 限制最大请求体大小为10MB，防止DoS攻击
         if (contentLength > 0 && contentLength <= 10 * 1024 * 1024) {
             std::string body;
             body.resize(contentLength);
@@ -259,64 +480,108 @@ HttpRequest HttpServer::parseRequest(int clientSocket) const {
     return request;
 }
 
+/**
+ * @brief 处理静态文件请求
+ * 
+ * 根据请求路径查找对应的文件，并生成HTTP响应。
+ * 支持：
+ * - 文件直接返回
+ * - 目录自动查找index.html
+ * - 目录列表（当无index.html时）
+ * 
+ * @param request 客户端请求对象
+ * @return HttpResponse 文件响应
+ */
 HttpResponse HttpServer::handleStaticFile(const HttpRequest& request) const {
+    // 获取请求路径
     std::string urlPath = request.getPath();
 
+    // 安全检查：防止路径遍历攻击
     if (isPathTraversal(urlPath)) {
         return HttpResponse::badRequest();
     }
 
+    // URL解码
     std::string decodedPath = urlDecode(urlPath);
+    
+    // 再次检查解码后的路径
     if (isPathTraversal(decodedPath)) {
         return HttpResponse::badRequest();
     }
 
+    // 构造完整文件路径
     std::string filePath = m_docRoot + decodedPath;
 
+    // 获取文件状态
     struct stat st;
     if (stat(filePath.c_str(), &st) < 0) {
+        // 文件不存在
         std::cerr << "File not found: " << filePath << std::endl;
         return HttpResponse::notFound();
     }
 
+    // 如果请求的是目录
     if (S_ISDIR(st.st_mode)) {
+        // 优先查找index.html
         std::string indexPath = filePath + "/index.html";
         if (stat(indexPath.c_str(), &st) == 0) {
             filePath = indexPath;
         } else {
+            // 没有index.html，生成目录列表
             return handleDirectory(filePath);
         }
     }
 
+    // 创建成功响应
     HttpResponse response;
     response.setStatusCode(HttpResponse::STATUS_200_OK);
-    response.setFilePath(filePath);
+    response.setFilePath(filePath);  // 设置文件路径，响应类会自动识别Content-Type
 
     return response;
 }
 
+/**
+ * @brief 处理目录请求 - 生成目录列表
+ * 
+ * 当目录中没有index.html时，生成一个HTML页面
+ * 列出目录中的所有文件和子目录。
+ * 
+ * @param dirPath 目录路径
+ * @return HttpResponse 包含HTML目录列表的响应
+ */
 HttpResponse HttpServer::handleDirectory(const std::string& dirPath) const {
     HttpResponse response;
     response.setStatusCode(HttpResponse::STATUS_200_OK);
     response.setContentType("text/html; charset=utf-8");
 
+    // 生成HTML头部
     std::string html = "<html><head><title>Directory Listing</title></head><body>";
+    
+    // 显示目录标题（相对路径）
     html += "<h1>Directory: " + dirPath.substr(m_docRoot.length()) + "</h1>";
     html += "<ul>";
 
+    // 打开目录
     DIR* dir = opendir(dirPath.c_str());
     if (dir) {
         struct dirent* entry;
+        
+        // 遍历目录中的所有条目
         while ((entry = readdir(dir)) != nullptr) {
             std::string name = entry->d_name;
+            
+            // 跳过"."（当前目录）和".."（父目录）
             if (name == "." || name == "..") continue;
 
             std::string fullPath = dirPath + "/" + name;
             struct stat st;
+            
             if (stat(fullPath.c_str(), &st) == 0) {
                 if (S_ISDIR(st.st_mode)) {
+                    // 目录：添加"/"后缀
                     html += "<li><a href=\"" + name + "/\">" + name + "/</a></li>";
                 } else {
+                    // 文件：直接链接
                     html += "<li><a href=\"" + name + "\">" + name + "</a></li>";
                 }
             }
@@ -330,35 +595,64 @@ HttpResponse HttpServer::handleDirectory(const std::string& dirPath) const {
     return response;
 }
 
+/**
+ * @brief URL解码
+ * 
+ * 将URL编码的字符串转换为普通字符串。
+ * 处理以下情况：
+ * - %XX: 十六进制编码的字符
+ * - +:   空格（HTTP表单中的特殊处理）
+ * 
+ * @param path URL编码的路径
+ * @return std::string 解码后的字符串
+ */
 std::string HttpServer::urlDecode(const std::string& path) const {
     std::string result;
+    
     for (size_t i = 0; i < path.length(); ++i) {
         if (path[i] == '%' && i + 2 < path.length()) {
+            // %XX 格式：两位十六进制数
             int value;
             std::istringstream iss(path.substr(i + 1, 2));
             if (iss >> std::hex >> value) {
                 result += static_cast<char>(value);
-                i += 2;
+                i += 2;  // 跳过已处理的两个十六进制字符
             } else {
+                // 无效的%编码，原样保留
                 result += path[i];
             }
         } else if (path[i] == '+') {
+            // + 号代表空格（application/x-www-form-urlencoded格式）
             result += ' ';
         } else {
+            // 普通字符
             result += path[i];
         }
     }
+    
     return result;
 }
 
+/**
+ * @brief 路径规范化
+ * 
+ * 移除路径中的冗余部分：
+ * - "/./": 当前目录标记
+ * - "//": 连续斜杠
+ * 
+ * @param path 原始路径
+ * @return std::string 规范化后的路径
+ */
 std::string HttpServer::normalizePath(const std::string& path) const {
     std::string result = path;
 
+    // 移除 "/./"
     size_t pos;
     while ((pos = result.find("/./")) != std::string::npos) {
         result.erase(pos, 2);
     }
 
+    // 移除 "//"
     while ((pos = result.find("//")) != std::string::npos) {
         result.erase(pos, 1);
     }
@@ -366,25 +660,52 @@ std::string HttpServer::normalizePath(const std::string& path) const {
     return result;
 }
 
+/**
+ * @brief 检查路径遍历攻击
+ * 
+ * 检测路径中是否包含".."（父目录引用），
+ * 这可能允许攻击者访问文档根目录之外的文件。
+ * 
+ * @param path 待检测的路径
+ * @return bool 存在风险返回true，安全返回false
+ */
 bool HttpServer::isPathTraversal(const std::string& path) const {
+    // 先规范化路径
     std::string normalized = normalizePath(path);
+    
+    // 检查是否包含".."
     return normalized.find("..") != std::string::npos;
 }
 
+/**
+ * @brief 从socket读取一行
+ * 
+ * 读取直到遇到换行符（\\n）的数据。
+ * 处理不同换行符格式：\\n, \\r\\n, \\r
+ * 
+ * @param socket socket描述符
+ * @param line 存储读取结果的字符串
+ * @return int 读取的字节数，-1表示错误或连接关闭
+ */
 int HttpServer::readLine(int socket, std::string& line) const {
     line.clear();
     char ch;
     ssize_t n;
 
+    // 按字节读取
     while (true) {
         n = read(socket, &ch, 1);
         if (n <= 0) {
+            // 连接关闭或出错
             return line.empty() ? -1 : line.length();
         }
 
         if (ch == '\n') {
+            // 换行符，行的结束
             break;
         }
+        
+        // 跳过\r（处理\r\n和\r的情况）
         if (ch != '\r') {
             line += ch;
         }
@@ -393,13 +714,25 @@ int HttpServer::readLine(int socket, std::string& line) const {
     return line.length();
 }
 
+/**
+ * @brief 从socket读取指定数量的数据
+ * 
+ * 确保读取到指定数量的字节（除非遇到EOF或错误）。
+ * 
+ * @param socket socket描述符
+ * @param buffer 数据缓冲区
+ * @param size 要读取的字节数
+ * @return ssize_t 实际读取的字节数
+ */
 ssize_t HttpServer::readData(int socket, char* buffer, size_t size) const {
     size_t totalRead = 0;
     ssize_t n;
 
+    // 循环读取直到达到指定数量
     while (totalRead < size) {
         n = read(socket, buffer + totalRead, size - totalRead);
         if (n <= 0) {
+            // EOF或错误，停止读取
             break;
         }
         totalRead += n;
@@ -408,18 +741,34 @@ ssize_t HttpServer::readData(int socket, char* buffer, size_t size) const {
     return totalRead;
 }
 
+/**
+ * @brief 向socket发送数据
+ * 
+ * 确保发送完所有数据（除非遇到错误）。
+ * 处理中断信号（EINTR）导致的write中断。
+ * 
+ * @param socket socket描述符
+ * @param data 要发送的数据指针
+ * @param size 要发送的字节数
+ * @return ssize_t 实际发送的字节数
+ */
 ssize_t HttpServer::sendData(int socket, const char* data, size_t size) const {
     size_t totalSent = 0;
     ssize_t n;
 
+    // 循环发送直到全部发送完成
     while (totalSent < size) {
         n = write(socket, data + totalSent, size - totalSent);
+        
         if (n <= 0) {
+            // 被中断信号打断，继续尝试
             if (errno == EINTR) {
                 continue;
             }
+            // 发送错误或连接关闭
             break;
         }
+        
         totalSent += n;
     }
 
