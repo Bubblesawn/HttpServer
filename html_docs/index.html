@@ -1,46 +1,254 @@
 <!DOCTYPE html>
 <html lang="zh-CN">
+<!-- 
+    抖音风格视频播放页面
+    作者: AI Assistant
+    功能: 模拟抖音APP的视频浏览体验，支持上下滑动切换视频
+-->
 <head>
     <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>小李的个人页面</title>
-    <style>
-        body {
-            font-family: Arial, sans-serif;
-            margin: 0;
-            padding: 0;
-            background-color: #f4f4f9;
-            color: #333;
-        }
-        .container {
-            width: 80%;
-            margin: 0 auto;
-            padding: 20px;
-            background-color: #fff;
-            box-shadow: 0 0 10px rgba(0, 0, 0, 0.1);
-            margin-top: 50px;
-        }
-        h1 {
-            text-align: center;
-            color: #4CAF50;
-        }
-        p {
-            line-height: 1.6;
-        }
-        img {
-            display: block;
-            margin: 0 auto;
-            max-width: 200px;
-            border-radius: 50%;
-        }
-    </style>
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <title>抖音 - 发现美好生活</title>
+    <!-- 引入样式文件 -->
+    <link rel="stylesheet" href="style.css">
+    <!-- 引入图标库 -->
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
 </head>
 <body>
-    <div class="container">
-        <img src="https://picsum.photos/200" alt="测试头像">
+    <!-- 顶部导航栏 -->
+    <header class="header">
+        <div class="header-tabs">
+            <span class="tab active">关注</span>
+            <span class="tab">发现</span>
+            <span class="tab">北京</span>
+        </div>
+    </header>
 
-        <h1>小李</h1>
-        <p>你好！我叫小李，是一名热爱编程的开发者。我专注于C/C++等语言的学习和应用，致力于开发高效、可靠的软件解决方案。很高兴在这里与你分享我的技术心得和项目经验。</p>
+    <!-- 视频播放区域容器 -->
+    <div class="video-container" id="videoContainer">
+        <!-- 单个视频项 -->
+        <div class="video-item active" data-index="0">
+            <!-- 视频元素 -->
+            <video 
+                class="video-player" 
+                src="https://commondatastorage.googleapis.com/gtv-videos-bucket/sample/ForBiggerBlazes.mp4"
+                loop
+                playsinline
+                webkit-playsinline
+                preload="metadata"
+            ></video>
+            
+            <!-- 视频加载Loading -->
+            <div class="video-loading">
+                <i class="fas fa-spinner fa-spin"></i>
+            </div>
+
+            <!-- 视频封面图（加载前显示） -->
+            <div class="video-cover"></div>
+
+            <!-- 播放/暂停图标 -->
+            <div class="play-icon">
+                <i class="fas fa-play"></i>
+            </div>
+
+            <!-- 右侧交互按钮区域 -->
+            <div class="right-actions">
+                <!-- 用户头像 -->
+                <div class="action-item avatar">
+                    <img src="https://api.dicebear.com/7.x/avataaars/svg?seed=1" alt="用户头像">
+                    <div class="plus-icon">+</div>
+                </div>
+
+                <!-- 点赞按钮 -->
+                <div class="action-item" onclick="toggleLike(0)">
+                    <i class="fas fa-heart"></i>
+                    <span class="count">12.8w</span>
+                </div>
+
+                <!-- 评论按钮 -->
+                <div class="action-item">
+                    <i class="fas fa-comment-dots"></i>
+                    <span class="count">1.2w</span>
+                </div>
+
+                <!-- 收藏按钮 -->
+                <div class="action-item">
+                    <i class="fas fa-star"></i>
+                    <span class="count">3.5w</span>
+                </div>
+
+                <!-- 分享按钮 -->
+                <div class="action-item">
+                    <i class="fas fa-share"></i>
+                    <span class="count">8000</span>
+                </div>
+            </div>
+
+            <!-- 底部视频信息 -->
+            <div class="bottom-info">
+                <div class="user-info">
+                    <span class="username">@用户昵称</span>
+                </div>
+                <div class="video-desc">
+                    #抖音 #分享视频 这是一个示例视频内容，模仿抖音界面设计。点击屏幕可以播放或暂停视频，上下滑动可以切换视频。
+                </div>
+                <div class="music-info">
+                    <i class="fas fa-music"></i>
+                    <span>原声音乐 - 热门歌曲</span>
+                </div>
+            </div>
+        </div>
+
+        <!-- 第二个视频 -->
+        <div class="video-item" data-index="1">
+            <video 
+                class="video-player" 
+                src="https://commondatastorage.googleapis.com/gtv-videos-bucket/sample/ForBiggerEscapes.mp4"
+                loop
+                playsinline
+                webkit-playsinline
+                preload="metadata"
+            ></video>
+            
+            <div class="video-loading">
+                <i class="fas fa-spinner fa-spin"></i>
+            </div>
+
+            <div class="video-cover"></div>
+
+            <div class="play-icon">
+                <i class="fas fa-play"></i>
+            </div>
+
+            <div class="right-actions">
+                <div class="action-item avatar">
+                    <img src="https://api.dicebear.com/7.x/avataaars/svg?seed=2" alt="用户头像">
+                    <div class="plus-icon">+</div>
+                </div>
+
+                <div class="action-item" onclick="toggleLike(1)">
+                    <i class="fas fa-heart"></i>
+                    <span class="count">8.9w</span>
+                </div>
+
+                <div class="action-item">
+                    <i class="fas fa-comment-dots"></i>
+                    <span class="count">5600</span>
+                </div>
+
+                <div class="action-item">
+                    <i class="fas fa-star"></i>
+                    <span class="count">2.1w</span>
+                </div>
+
+                <div class="action-item">
+                    <i class="fas fa-share"></i>
+                    <span class="count">3200</span>
+                </div>
+            </div>
+
+            <div class="bottom-info">
+                <div class="user-info">
+                    <span class="username">@第二个用户</span>
+                </div>
+                <div class="video-desc">
+                    第二个视频示例，精彩内容不容错过！快来一起欣赏吧～
+                </div>
+                <div class="music-info">
+                    <i class="fas fa-music"></i>
+                    <span>背景音乐 - 动感节奏</span>
+                </div>
+            </div>
+        </div>
+
+        <!-- 第三个视频 -->
+        <div class="video-item" data-index="2">
+            <video 
+                class="video-player" 
+                src="https://commondatastorage.googleapis.com/gtv-videos-bucket/sample/ForBiggerFun.mp4"
+                loop
+                playsinline
+                webkit-playsinline
+                preload="metadata"
+            ></video>
+            
+            <div class="video-loading">
+                <i class="fas fa-spinner fa-spin"></i>
+            </div>
+
+            <div class="video-cover"></div>
+
+            <div class="play-icon">
+                <i class="fas fa-play"></i>
+            </div>
+
+            <div class="right-actions">
+                <div class="action-item avatar">
+                    <img src="https://api.dicebear.com/7.x/avataaars/svg?seed=3" alt="用户头像">
+                    <div class="plus-icon">+</div>
+                </div>
+
+                <div class="action-item" onclick="toggleLike(2)">
+                    <i class="fas fa-heart"></i>
+                    <span class="count">15.6w</span>
+                </div>
+
+                <div class="action-item">
+                    <i class="fas fa-comment-dots"></i>
+                    <span class="count">2.3w</span>
+                </div>
+
+                <div class="action-item">
+                    <i class="fas fa-star"></i>
+                    <span class="count">5.8w</span>
+                </div>
+
+                <div class="action-item">
+                    <i class="fas fa-share"></i>
+                    <span class="count">1.2w</span>
+                </div>
+            </div>
+
+            <div class="bottom-info">
+                <div class="user-info">
+                    <span class="username">@第三个用户</span>
+                </div>
+                <div class="video-desc">
+                    第三个视频内容，每天分享精彩瞬间，发现美好生活！
+                </div>
+                <div class="music-info">
+                    <i class="fas fa-music"></i>
+                    <span>背景音乐 - 轻音乐</span>
+                </div>
+            </div>
+        </div>
     </div>
+
+    <!-- 底部导航栏 -->
+    <nav class="bottom-nav">
+        <div class="nav-item active">
+            <i class="fas fa-home"></i>
+            <span>首页</span>
+        </div>
+        <div class="nav-item">
+            <i class="fas fa-user-friends"></i>
+            <span>朋友</span>
+        </div>
+        <div class="nav-item">
+            <i class="fas fa-plus-square"></i>
+            <span>上传</span>
+        </div>
+        <div class="nav-item">
+            <i class="fas fa-comment"></i>
+            <span>消息</span>
+        </div>
+        <div class="nav-item">
+            <i class="fas fa-user"></i>
+            <span>我</span>
+        </div>
+    </nav>
+
+    <!-- 引入JavaScript文件 -->
+    <script src="app.js"></script>
 </body>
 </html>
