@@ -2,6 +2,9 @@
 #include <csignal>
 #include <cstdlib>
 #include <getopt.h>
+#include <fstream>
+#include <sstream>
+#include <string>
 #include "../server/http_server.h"
 
 /**
@@ -32,6 +35,84 @@ void signalHandler(int signum) {
 }
 
 /**
+ * @brief 配置文件解析结构体
+ * 
+ * 用于存储从配置文件中读取的各项参数。
+ */
+struct Config {
+    int port;              /**< 服务器监听端口 */
+    int threadPoolSize;    /**< 线程池大小 */
+    std::string docRoot;   /**< 文档根目录 */
+    int debug;             /**< 调试模式 */
+    
+    Config() : port(8080), threadPoolSize(4), docRoot("./html_docs"), debug(0) {}
+};
+
+/**
+ * @brief 解析配置文件
+ * 
+ * 读取并解析 HTTP 服务器的配置文件，支持以下选项：
+ *   - port: 服务器监听端口
+ *   - thread_pool_size: 线程池大小
+ *   - doc_root: 文档根目录
+ *   - debug: 调试模式
+ * 
+ * @param configFilePath 配置文件路径
+ * @param config 输出参数，解析后的配置结果
+ * @return bool 解析成功返回 true，失败返回 false
+ */
+bool parseConfigFile(const std::string& configFilePath, Config& config) {
+    std::ifstream configFile(configFilePath);
+    if (!configFile.is_open()) {
+        std::cerr << "Error: Cannot open config file: " << configFilePath << std::endl;
+        return false;
+    }
+    
+    std::string line;
+    while (std::getline(configFile, line)) {
+        // 去除首尾空白字符
+        size_t start = line.find_first_not_of(" \t\r\n");
+        size_t end = line.find_last_not_of(" \t\r\n");
+        
+        // 跳过空行和注释行
+        if (start == std::string::npos || line[start] == '#') {
+            continue;
+        }
+        
+        line = line.substr(start, end - start + 1);
+        
+        // 解析 key value 格式
+        size_t spacePos = line.find(' ');
+        if (spacePos == std::string::npos) {
+            continue;
+        }
+        
+        std::string key = line.substr(0, spacePos);
+        std::string value = line.substr(spacePos + 1);
+        
+        // 去除 value 中的空白
+        start = value.find_first_not_of(" \t");
+        end = value.find_last_not_of(" \t");
+        if (start != std::string::npos) {
+            value = value.substr(start, end - start + 1);
+        }
+        
+        if (key == "port") {
+            config.port = std::stoi(value);
+        } else if (key == "thread_pool_size") {
+            config.threadPoolSize = std::stoi(value);
+        } else if (key == "doc_root") {
+            config.docRoot = value;
+        } else if (key == "debug") {
+            config.debug = std::stoi(value);
+        }
+    }
+    
+    configFile.close();
+    return true;
+}
+
+/**
  * @brief 打印程序使用说明
  * 
  * 显示所有可用的命令行选项及其说明。
@@ -41,6 +122,7 @@ void signalHandler(int signum) {
 void printUsage(const char* programName) {
     std::cout << "Usage: " << programName << " [OPTIONS]\n"
               << "Options:\n"
+              << "  -c, --config FILE      Configuration file (default: ./http_server.conf)\n"
               << "  -p, --port PORT        Server port (default: 8080)\n"
               << "  -d, --doc-root DIR     Document root directory (default: ./html_docs)\n"
               << "  -t, --threads NUM      Number of threads (default: 4)\n"
@@ -79,22 +161,44 @@ void printVersion() {
  *   ./http_server --port=9000 --doc-root=/home/user/www
  */
 int main(int argc, char* argv[]) {
-    /** 默认配置值 */
-    int port = 8080;           /**< 服务器监听端口 */
-    std::string docRoot = "./html_docs";  /**< 文档根目录 */
-    int numThreads = 4;        /**< 线程池线程数量 */
-
+    /** 配置文件路径 */
+    std::string configFile = "./http_server.conf";
+    
     /**
-     * 命令行选项定义数组
-     * 使用 getopt_long 标准库函数解析长选项和短选项
-     * 
-     * 结构体说明：
-     *   name:       长选项名称
-     *   has_arg:    是否需要参数（no_argument=0, required_argument=1, optional_argument=2）
-     *   flag:       如果为nullptr，则返回val作为返回值；否则将*flag设为val并返回0
-     *   val:        短选项字符或用于返回的长选项标识
+     * 第一步：先解析 -c 参数获取配置文件路径
      */
+    static struct option configOption[] = {
+        {"config", required_argument, 0, 'c'},
+        {0, 0, 0, 0}
+    };
+    
+    int opt;
+    int optionIndex = 0;
+    while ((opt = getopt_long(argc, argv, "c:", configOption, &optionIndex)) != -1) {
+        if (opt == 'c') {
+            configFile = optarg;
+        }
+    }
+    
+    /** 重置 optind 以便后续解析其他参数 */
+    optind = 1;
+    
+    /**
+     * 第二步：解析配置文件
+     */
+    Config config;
+    if (parseConfigFile(configFile, config)) {
+        std::cout << "Loaded config from: " << configFile << std::endl;
+    }
+    
+    /** 使用配置文件的值作为默认值 */
+    int port = config.port;
+    std::string docRoot = config.docRoot;
+    int numThreads = config.threadPoolSize;
+    
+    /** 第三步：解析其他命令行参数（命令行参数优先级最高） */
     static struct option longOptions[] = {
+        {"config", required_argument, 0, 'c'},
         {"port", required_argument, 0, 'p'},
         {"doc-root", required_argument, 0, 'd'},
         {"threads", required_argument, 0, 't'},
@@ -103,8 +207,8 @@ int main(int argc, char* argv[]) {
         {0, 0, 0, 0}
     };
 
-    int optionIndex = 0;  /**< 指向当前解析选项的索引 */
-    int c;                /**< getopt_long 返回的字符 */
+    optionIndex = 0;
+    int c;
 
     /**
      * 解析命令行参数循环
@@ -118,8 +222,12 @@ int main(int argc, char* argv[]) {
      *   - -1:   所有选项已解析完毕
      *   - '?':  遇到未知选项或缺少必需参数
      */
-    while ((c = getopt_long(argc, argv, "p:d:t:hv", longOptions, &optionIndex)) != -1) {
+    while ((c = getopt_long(argc, argv, "c:p:d:t:hv", longOptions, &optionIndex)) != -1) {
         switch (c) {
+            case 'c':
+                /** 设置配置文件路径 */
+                configFile = optarg;
+                break;
             case 'p':
                 /** 解析端口参数 */
                 port = std::atoi(optarg);
