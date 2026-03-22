@@ -233,6 +233,7 @@ HttpRequest::Method HttpRequest::stringToMethod(const std::string& method) {
     if (strcasecmp(method.c_str(), "POST") == 0) return METHOD_POST;
     if (strcasecmp(method.c_str(), "PUT") == 0) return METHOD_PUT;
     if (strcasecmp(method.c_str(), "DELETE") == 0) return METHOD_DELETE;
+    if (strcasecmp(method.c_str(), "HEAD") == 0) return METHOD_HEAD;
     return METHOD_UNKNOWN;
 }
 
@@ -250,6 +251,7 @@ std::string HttpRequest::methodToString(Method method) {
         case METHOD_POST:   return "POST";
         case METHOD_PUT:    return "PUT";
         case METHOD_DELETE: return "DELETE";
+        case METHOD_HEAD:   return "HEAD";
         default:            return "UNKNOWN";
     }
 }

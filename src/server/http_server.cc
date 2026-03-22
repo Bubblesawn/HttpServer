@@ -387,6 +387,19 @@ void HttpServer::handleClient(int clientSocket, const std::string& clientIp, int
                     // GET请求提供静态文件服务
                     response = handleStaticFile(request);
                 }
+            } else if (request.getMethod() == HttpRequest::METHOD_HEAD) {
+                // HEAD请求处理：与GET相同，但不返回响应体
+                if (request.getPath() == "/api/echo") {
+                    response = handleApiEcho(request);
+                } else {
+                    response = handleStaticFile(request);
+                }
+                // HEAD请求不返回响应体，清空body和文件路径
+                // 注意：保留Content-Type，因为HEAD响应应该包含与GET相同的头部信息
+                std::string contentType = response.getContentType();
+                response.setBody("");
+                response.setFilePath("");
+                response.setContentType(contentType);
             } else if (request.getMethod() == HttpRequest::METHOD_POST) {
                 // POST请求处理
                 response = handlePostRequest(request);

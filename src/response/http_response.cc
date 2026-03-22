@@ -224,7 +224,8 @@ std::string HttpResponse::toString() const {
     std::string result;
 
     // 1. 状态行：HTTP/1.1 <状态码> <状态消息>
-    result = "HTTP/1.1 " + std::to_string(m_statusCode) + " " + m_statusMessage + "\r\n";
+    // 将枚举类型转换为整数后再转换为字符串
+    result = "HTTP/1.1 " + std::to_string(static_cast<int>(m_statusCode)) + " " + m_statusMessage + "\r\n";
 
     // 2. Content-Type头部
     if (!m_contentType.empty()) {
