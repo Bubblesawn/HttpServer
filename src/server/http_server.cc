@@ -143,6 +143,9 @@ bool HttpServer::start() {
     // 根据模式选择启动方式
     if (m_useEpoll) {
         // ========== epoll模式 ==========
+        // 创建线程池（用于处理请求）
+        m_threadPool = std::make_unique<ThreadPool>(m_numThreads);
+
         // 创建epoll管理器
         m_epollManager = std::make_unique<EpollManager>();
         if (!m_epollManager->create()) {
@@ -181,7 +184,8 @@ bool HttpServer::start() {
 
         LOG_INFO("Server started on " + m_ip + ":" + std::to_string(m_port));
         LOG_INFO("Document root: " + m_docRoot);
-        LOG_INFO("Mode: epoll (event-driven)");
+        LOG_INFO("Thread pool size: " + std::to_string(m_numThreads));
+        LOG_INFO("Mode: epoll + thread pool (hybrid)");
     } else {
         // ========== 传统线程池模式 ==========
         // 创建线程池
@@ -237,6 +241,12 @@ void HttpServer::stop() {
         // 等待epoll事件处理线程结束
         if (m_epollThread.joinable()) {
             m_epollThread.join();
+        }
+
+        // 关闭线程池，等待所有任务完成
+        if (m_threadPool) {
+            m_threadPool->shutdown();
+            m_threadPool.reset();
         }
 
         // 关闭所有客户端连接
@@ -506,12 +516,12 @@ void HttpServer::handleServerRead(int serverSocket, uint32_t events) {
             m_clientInfoMap[clientSocket] = {std::string(clientIp), clientPort, ""};
         }
 
-        // 添加客户端socket到epoll监听（边缘触发模式）
+        // 添加客户端socket到epoll监听（水平触发模式，简化处理逻辑）
         auto clientCallback = [this](int fd, uint32_t ev) {
             this->handleClientRead(fd, ev);
         };
 
-        if (!m_epollManager->addFd(clientSocket, EpollEventType::READ, clientCallback, true)) {
+        if (!m_epollManager->addFd(clientSocket, EpollEventType::READ, clientCallback, false)) {
             LOG_ERROR("Failed to add client socket to epoll");
             close(clientSocket);
             std::lock_guard<std::mutex> lock(m_clientInfoMutex);
@@ -525,7 +535,10 @@ void HttpServer::handleServerRead(int serverSocket, uint32_t events) {
  * @brief 处理客户端可读事件（epoll模式）
  *
  * 当epoll检测到客户端socket可读时调用。
- * 在边缘触发(ET)模式下，必须循环读取直到EAGAIN，确保读完所有数据。
+ * 将请求提交到线程池处理，实现IO事件通知与请求处理的分离。
+ *
+ * 注意：使用水平触发(LT)模式，epoll会重复通知直到数据处理完毕。
+ * 这里采用"一个连接由一个线程处理"的方式，处理完即关闭连接。
  *
  * @param clientSocket 客户端socket描述符
  * @param events epoll事件标志
@@ -548,14 +561,21 @@ void HttpServer::handleClientRead(int clientSocket, uint32_t events) {
             cleanupClient(clientSocket);
             return;
         }
+        // 取出客户端信息后从map中移除（表示正在处理中）
         clientInfo = it->second;
+        m_clientInfoMap.erase(it);
     }
 
-    // 处理请求（复用原有的handleClient逻辑）
-    handleClient(clientSocket, clientInfo.ip, clientInfo.port);
+    // 从epoll中移除该fd（避免重复触发）
+    m_epollManager->removeFd(clientSocket);
 
-    // 处理完成后关闭连接（HTTP短连接模式）
-    cleanupClient(clientSocket);
+    // 将请求处理提交到线程池
+    m_threadPool->enqueue([this, clientSocket, clientInfo]() {
+        // 在线程池中处理请求
+        this->handleClient(clientSocket, clientInfo.ip, clientInfo.port);
+        // 处理完成后关闭socket
+        close(clientSocket);
+    });
 }
 
 /**
