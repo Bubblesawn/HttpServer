@@ -240,9 +240,11 @@ std::string HttpResponse::toString() const {
         result += header.first + ": " + header.second + "\r\n";
     }
 
-    // 5. Content-Length头部（仅当有响应体时）
-    if (!m_body.empty()) {
-        result += "Content-Length: " + std::to_string(m_body.size()) + "\r\n";
+    // 5. Content-Length头部（无论响应体是在内存中还是文件中）
+    // 必须始终添加 Content-Length，即使文件不存在也能让客户端知道响应体大小
+    size_t bodySize = getBodySize();
+    if (bodySize > 0 || !m_filePath.empty()) {
+        result += "Content-Length: " + std::to_string(bodySize) + "\r\n";
     }
 
     // 6. Connection头部
