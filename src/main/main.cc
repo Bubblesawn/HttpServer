@@ -47,8 +47,9 @@ struct Config {
     int threadPoolSize;    /**< 线程池大小 */
     std::string docRoot;   /**< 文档根目录 */
     int debug;             /**< 调试模式 */
+    int logToConsole;      /**< 日志是否输出到控制台 (1=是, 0=否) */
     
-    Config() : port(8080), threadPoolSize(4), docRoot("./html_docs"), debug(0) {}
+    Config() : port(8080), threadPoolSize(4), docRoot("./html_docs"), debug(0), logToConsole(1) {}
 };
 
 /**
@@ -108,6 +109,8 @@ bool parseConfigFile(const std::string& configFilePath, Config& config) {
             config.docRoot = value;
         } else if (key == "debug") {
             config.debug = std::stoi(value);
+        } else if (key == "log_to_console") {
+            config.logToConsole = std::stoi(value);
         }
     }
     
@@ -298,7 +301,9 @@ int main(int argc, char* argv[]) {
     signal(SIGTERM, signalHandler);
 
     // 初始化日志系统
-    if (!Logger::getInstance().init("./logs/access.log", "./logs/error.log", LogLevel::INFO, true)) {
+    // 根据配置文件中的 log_to_console 设置决定是否输出到控制台
+    bool consoleOutput = (config.logToConsole != 0);
+    if (!Logger::getInstance().init("./logs/access.log", "./logs/error.log", LogLevel::INFO, consoleOutput)) {
         std::cerr << "Failed to initialize logger" << std::endl;
         return 1;
     }

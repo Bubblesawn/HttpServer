@@ -14,8 +14,9 @@
 }
 
 html, body {
-    /* 设置HTML和body高度为100% */
-    height: 100%;
+    /* 设置HTML和body高度为100%视口高度 */
+    height: 100vh;
+    width: 100vw;
     /* 隐藏溢出内容，防止出现滚动条 */
     overflow: hidden;
     /* 设置背景颜色为黑色 */
@@ -90,12 +91,14 @@ html, body {
 
 /* ==================== 视频容器样式 ==================== */
 .video-container {
-    /* 设置高度为100% */
-    height: 100%;
-    /* 设置宽度为100% */
-    width: 100%;
+    /* 设置高度为100%视口高度，减去底部导航栏高度 */
+    height: 100vh;
+    /* 设置宽度为100%视口宽度 */
+    width: 100vw;
     /* 设置相对定位 */
     position: relative;
+    /* 设置背景颜色为黑色 */
+    background-color: #000;
 }
 
 /* 单个视频项样式 */
@@ -107,10 +110,10 @@ html, body {
     left: 0;
     right: 0;
     bottom: 0;
-    /* 设置高度为100% */
-    height: 100%;
-    /* 设置宽度为100% */
-    width: 100%;
+    /* 设置高度为100%视口高度 */
+    height: 100vh;
+    /* 设置宽度为100%视口宽度 */
+    width: 100vw;
     /* 设置背景颜色为黑色 */
     background-color: #000;
     /* 隐藏溢出内容 */
@@ -121,6 +124,10 @@ html, body {
     transition: opacity 0.3s ease;
     /* 设置z-index为1 */
     z-index: 1;
+    /* 使用flex布局使视频居中 */
+    display: flex;
+    justify-content: center;
+    align-items: center;
 }
 
 .video-item.active {
@@ -136,10 +143,13 @@ html, body {
     width: 100%;
     /* 设置高度为100% */
     height: 100%;
-    /* 设置对象-fit为cover，保持比例填充 */
+    /* 设置对象-fit为cover，保持比例填充整个屏幕 */
     object-fit: cover;
     /* 设置垂直居中 */
     vertical-align: middle;
+    /* 确保视频占满整个容器 */
+    min-width: 100%;
+    min-height: 100%;
 }
 
 /* 视频封面图样式 */
@@ -215,10 +225,10 @@ html, body {
 .right-actions {
     /* 设置绝对定位 */
     position: absolute;
-    /* 设置右侧距离为10px */
-    right: 10px;
-    /* 设置底部距离为120px */
-    bottom: 120px;
+    /* 设置右侧距离为15px */
+    right: 15px;
+    /* 设置底部距离为100px，为底部导航栏留出空间 */
+    bottom: 100px;
     /* 设置z-index为20 */
     z-index: 20;
     /* 使用Flexbox布局，列方向 */
@@ -230,7 +240,7 @@ html, body {
     /* 设置列方向 */
     flex-direction: column;
     /* 设置项目之间的间距 */
-    gap: 25px;
+    gap: 20px;
 }
 
 /* 交互按钮项样式 */
@@ -349,10 +359,10 @@ html, body {
     position: absolute;
     /* 设置左侧距离为15px */
     left: 15px;
-    /* 设置右侧距离为80px */
-    right: 80px;
-    /* 设置底部距离为100px */
-    bottom: 100px;
+    /* 设置右侧距离为90px，为右侧按钮留出空间 */
+    right: 90px;
+    /* 设置底部距离为80px，为底部导航栏留出空间 */
+    bottom: 80px;
     /* 设置z-index为20 */
     z-index: 20;
 }
@@ -511,30 +521,34 @@ html, body {
 }
 
 /* ==================== 响应式设计 ==================== */
-/* 当屏幕宽度大于768px时 */
+/* 当屏幕宽度大于768px时（平板和桌面） */
 @media screen and (min-width: 768px) {
-    /* 视频最大宽度限制 */
+    /* 视频保持全屏显示，不限制宽度 */
     .video-player {
-        /* 设置最大宽度为450px */
-        max-width: 450px;
-        /* 设置左右边距为自动，居中显示 */
-        margin: 0 auto;
+        /* 设置宽度为100% */
+        width: 100%;
+        /* 设置高度为100% */
+        height: 100%;
+        /* 取消最大宽度限制，让视频占满屏幕 */
+        max-width: none;
+        /* 设置对象-fit为cover，保持比例填充 */
+        object-fit: cover;
     }
 
-    /* 调整右侧按钮位置 */
+    /* 右侧按钮保持在右侧 */
     .right-actions {
-        /* 设置右侧距离为calc(50% - 240px) */
-        right: calc(50% - 240px);
+        /* 设置右侧距离为15px */
+        right: 15px;
     }
 
-    /* 调整底部信息位置 */
+    /* 底部信息调整右侧边距 */
     .bottom-info {
-        /* 设置右侧距离为calc(50% - 230px) */
-        right: calc(50% - 230px);
+        /* 设置右侧距离为100px，为右侧按钮留出空间 */
+        right: 100px;
     }
 }
 
-/* 当屏幕高度大于宽度时（竖屏） */
+/* 当屏幕高度大于宽度时（竖屏模式） */
 @media screen and (orientation: portrait) {
     .video-player {
         /* 设置宽度为100% */
@@ -543,17 +557,19 @@ html, body {
         height: 100%;
         /* 取消最大宽度限制 */
         max-width: none;
+        /* 设置对象-fit为cover，保持比例填充 */
+        object-fit: cover;
     }
 }
 
-/* 当屏幕宽度大于高度时（横屏） */
+/* 当屏幕宽度大于高度时（横屏模式） */
 @media screen and (orientation: landscape) {
     .video-player {
         /* 设置宽度为100% */
         width: 100%;
         /* 设置高度为100% */
         height: 100%;
-        /* 设置对象-fit为contain，保持比例完整显示 */
-        object-fit: contain;
+        /* 设置对象-fit为cover，保持比例填充整个屏幕 */
+        object-fit: cover;
     }
 }
