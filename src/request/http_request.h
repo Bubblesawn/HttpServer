@@ -212,6 +212,44 @@ public:
      */
     static std::string methodToString(Method method);
 
+    /**
+     * @brief 解析URL编码的查询参数
+     * 
+     * 从URL的查询字符串中解析出键值对参数。
+     * 支持 application/x-www-form-urlencoded 格式。
+     * 
+     * @return std::map<std::string, std::string> 参数键值对
+     */
+    std::map<std::string, std::string> parseQueryParams() const;
+
+    /**
+     * @brief 解析POST请求体中的表单数据
+     * 
+     * 根据Content-Type解析请求体中的表单数据。
+     * 支持 application/x-www-form-urlencoded 格式。
+     * 
+     * @return std::map<std::string, std::string> 表单数据键值对
+     */
+    std::map<std::string, std::string> parseFormData() const;
+
+    /**
+     * @brief 获取Content-Type头部值
+     * 
+     * @return std::string Content-Type值，如果不存在返回空字符串
+     */
+    std::string getContentType() const;
+
+    /**
+     * @brief URL解码函数
+     * 
+     * 将URL编码的字符串解码为原始字符串。
+     * 支持 %XX 格式的编码。
+     * 
+     * @param encoded URL编码的字符串
+     * @return std::string 解码后的字符串
+     */
+    static std::string urlDecode(const std::string& encoded);
+
 private:
     /** HTTP请求方法 */
     Method m_method;

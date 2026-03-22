@@ -253,3 +253,151 @@ std::string HttpRequest::methodToString(Method method) {
         default:            return "UNKNOWN";
     }
 }
+
+/**
+ * @brief URL解码函数
+ * 
+ * 将URL编码的字符串解码为原始字符串。
+ * 支持 %XX 格式的编码（如 %20 转换为空格）。
+ * 
+ * @param encoded URL编码的字符串
+ * @return std::string 解码后的字符串
+ */
+std::string HttpRequest::urlDecode(const std::string& encoded) {
+    std::string decoded;
+    decoded.reserve(encoded.length());
+    
+    for (size_t i = 0; i < encoded.length(); ++i) {
+        if (encoded[i] == '%' && i + 2 < encoded.length()) {
+            // 解析 %XX 格式的十六进制编码
+            int hex1 = encoded[i + 1];
+            int hex2 = encoded[i + 2];
+            
+            // 将十六进制字符转换为数值
+            int value = 0;
+            if (hex1 >= '0' && hex1 <= '9') value = (hex1 - '0') << 4;
+            else if (hex1 >= 'A' && hex1 <= 'F') value = (hex1 - 'A' + 10) << 4;
+            else if (hex1 >= 'a' && hex1 <= 'f') value = (hex1 - 'a' + 10) << 4;
+            
+            if (hex2 >= '0' && hex2 <= '9') value |= (hex2 - '0');
+            else if (hex2 >= 'A' && hex2 <= 'F') value |= (hex2 - 'A' + 10);
+            else if (hex2 >= 'a' && hex2 <= 'f') value |= (hex2 - 'a' + 10);
+            
+            decoded += static_cast<char>(value);
+            i += 2;  // 跳过接下来的两个字符
+        } else if (encoded[i] == '+') {
+            // URL编码中 + 表示空格
+            decoded += ' ';
+        } else {
+            decoded += encoded[i];
+        }
+    }
+    
+    return decoded;
+}
+
+/**
+ * @brief 解析URL编码的查询参数
+ * 
+ * 从URL的查询字符串中解析出键值对参数。
+ * 格式: ?key1=value1&key2=value2
+ * 
+ * @return std::map<std::string, std::string> 参数键值对
+ */
+std::map<std::string, std::string> HttpRequest::parseQueryParams() const {
+    std::map<std::string, std::string> params;
+    
+    // 查找查询字符串起始位置
+    size_t queryPos = m_url.find('?');
+    if (queryPos == std::string::npos) {
+        return params;  // 没有查询字符串
+    }
+    
+    // 提取查询字符串部分（去掉?）
+    std::string queryString = m_url.substr(queryPos + 1);
+    
+    // 解析键值对
+    size_t start = 0;
+    while (start < queryString.length()) {
+        // 查找 & 分隔符
+        size_t ampPos = queryString.find('&', start);
+        std::string pair;
+        
+        if (ampPos == std::string::npos) {
+            pair = queryString.substr(start);
+            start = queryString.length();
+        } else {
+            pair = queryString.substr(start, ampPos - start);
+            start = ampPos + 1;
+        }
+        
+        // 解析 key=value
+        size_t eqPos = pair.find('=');
+        if (eqPos != std::string::npos) {
+            std::string key = urlDecode(pair.substr(0, eqPos));
+            std::string value = urlDecode(pair.substr(eqPos + 1));
+            params[key] = value;
+        } else if (!pair.empty()) {
+            // 只有key没有value的情况
+            params[urlDecode(pair)] = "";
+        }
+    }
+    
+    return params;
+}
+
+/**
+ * @brief 解析POST请求体中的表单数据
+ * 
+ * 根据Content-Type解析请求体中的表单数据。
+ * 支持 application/x-www-form-urlencoded 格式。
+ * 
+ * @return std::map<std::string, std::string> 表单数据键值对
+ */
+std::map<std::string, std::string> HttpRequest::parseFormData() const {
+    std::map<std::string, std::string> formData;
+    
+    // 检查Content-Type是否为表单类型
+    std::string contentType = getContentType();
+    if (contentType.find("application/x-www-form-urlencoded") == std::string::npos) {
+        return formData;  // 不是URL编码的表单数据
+    }
+    
+    // 请求体格式与查询字符串相同: key1=value1&key2=value2
+    size_t start = 0;
+    while (start < m_body.length()) {
+        // 查找 & 分隔符
+        size_t ampPos = m_body.find('&', start);
+        std::string pair;
+        
+        if (ampPos == std::string::npos) {
+            pair = m_body.substr(start);
+            start = m_body.length();
+        } else {
+            pair = m_body.substr(start, ampPos - start);
+            start = ampPos + 1;
+        }
+        
+        // 解析 key=value
+        size_t eqPos = pair.find('=');
+        if (eqPos != std::string::npos) {
+            std::string key = urlDecode(pair.substr(0, eqPos));
+            std::string value = urlDecode(pair.substr(eqPos + 1));
+            formData[key] = value;
+        } else if (!pair.empty()) {
+            // 只有key没有value的情况
+            formData[urlDecode(pair)] = "";
+        }
+    }
+    
+    return formData;
+}
+
+/**
+ * @brief 获取Content-Type头部值
+ * 
+ * @return std::string Content-Type值，如果不存在返回空字符串
+ */
+std::string HttpRequest::getContentType() const {
+    return getHeader("Content-Type");
+}

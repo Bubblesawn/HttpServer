@@ -6,6 +6,7 @@
 #include <sstream>
 #include <string>
 #include "../server/http_server.h"
+#include "../logger/logger.h"
 
 /**
  * @brief 全局服务器实例指针
@@ -26,10 +27,12 @@ static HttpServer* g_server = nullptr;
 void signalHandler(int signum) {
     // 处理 SIGINT(用户按 Ctrl+C)  和 SIGTERM(用户输入kill) 信号
     if (signum == SIGINT || signum == SIGTERM) {
-        std::cout << "\nShutting down server..." << std::endl;
+        LOG_INFO("Shutting down server...");
         if (g_server) {
             g_server->stop();
         }
+        // 关闭日志系统
+        Logger::getInstance().shutdown();
         exit(0);
     }
 }
@@ -294,12 +297,18 @@ int main(int argc, char* argv[]) {
     signal(SIGINT, signalHandler);
     signal(SIGTERM, signalHandler);
 
+    // 初始化日志系统
+    if (!Logger::getInstance().init("./logs/access.log", "./logs/error.log", LogLevel::INFO, true)) {
+        std::cerr << "Failed to initialize logger" << std::endl;
+        return 1;
+    }
+
     /** 创建HTTP服务器实例，监听所有网络接口 */
     HttpServer server("0.0.0.0", port);
-    
+
     /** 配置服务器文档根目录 */
     server.setDocRoot(docRoot);
-    
+
     /** 配置线程池大小 */
     server.setNumThreads(numThreads);
 
@@ -308,12 +317,12 @@ int main(int argc, char* argv[]) {
 
     /** 启动服务器并检查启动结果 */
     if (!server.start()) {
-        std::cerr << "Failed to start server" << std::endl;
+        LOG_ERROR("Failed to start server");
         return 1;
     }
 
     /** 服务器启动成功，输出提示信息 */
-    std::cout << "Server is running. Press Ctrl+C to stop." << std::endl;
+    LOG_INFO("Server is running. Press Ctrl+C to stop.");
 
     /**
      * @brief 主循环 - 保持服务器运行

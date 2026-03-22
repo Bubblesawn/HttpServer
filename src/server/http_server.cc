@@ -10,6 +10,7 @@
 #include "../request/http_request.h"
 #include "../response/http_response.h"
 #include "../thread/thread_pool.h"
+#include <thread>
 
 // POSIX网络编程头文件
 #include <sys/socket.h>      // socket编程接口
@@ -136,10 +137,16 @@ bool HttpServer::start() {
     // 创建线程池
     m_threadPool = std::make_unique<ThreadPool>(m_numThreads);
 
+    // 启动接受连接的线程
+    m_acceptThread = std::thread(&HttpServer::acceptConnections, this);
+    
+    // 短暂等待让线程启动
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+
     // 输出启动信息
-    std::cout << "Server started on " << m_ip << ":" << m_port << std::endl;
-    std::cout << "Document root: " << m_docRoot << std::endl;
-    std::cout << "Thread pool size: " << m_numThreads << std::endl;
+    LOG_INFO("Server started on " + m_ip + ":" + std::to_string(m_port));
+    LOG_INFO("Document root: " + m_docRoot);
+    LOG_INFO("Thread pool size: " + std::to_string(m_numThreads));
 
     return true;
 }
@@ -169,13 +176,18 @@ void HttpServer::stop() {
         m_serverSocket = -1;
     }
 
+    // 等待接受连接的线程结束
+    if (m_acceptThread.joinable()) {
+        m_acceptThread.join();
+    }
+
     // 关闭线程池，等待所有任务完成
     if (m_threadPool) {
         m_threadPool->shutdown();
         m_threadPool.reset();  // 释放智能指针
     }
 
-    std::cout << "Server stopped" << std::endl;
+    LOG_INFO("Server stopped");
 }
 
 /**
@@ -347,6 +359,9 @@ void HttpServer::acceptConnections() {
  * @param clientPort 客户端端口号
  */
 void HttpServer::handleClient(int clientSocket, const std::string& clientIp, int clientPort) {
+    // 记录请求开始时间
+    auto startTime = std::chrono::steady_clock::now();
+
     // 初始化请求和响应对象
     HttpRequest request;
     request.setClientIp(clientIp);
@@ -363,9 +378,18 @@ void HttpServer::handleClient(int clientSocket, const std::string& clientIp, int
             // 使用自定义处理函数
             response = m_requestHandler(request);
         } else {
-            // 默认处理：GET请求提供静态文件服务
+            // 默认处理
             if (request.getMethod() == HttpRequest::METHOD_GET) {
-                response = handleStaticFile(request);
+                // 处理API端点
+                if (request.getPath() == "/api/echo") {
+                    response = handleApiEcho(request);
+                } else {
+                    // GET请求提供静态文件服务
+                    response = handleStaticFile(request);
+                }
+            } else if (request.getMethod() == HttpRequest::METHOD_POST) {
+                // POST请求处理
+                response = handlePostRequest(request);
             } else {
                 // 其他HTTP方法返回501 Not Implemented
                 response = HttpResponse::notImplemented();
@@ -373,7 +397,7 @@ void HttpServer::handleClient(int clientSocket, const std::string& clientIp, int
         }
     } catch (const std::exception& e) {
         // 捕获异常并返回500错误
-        std::cerr << "Request handling exception: " << e.what() << std::endl;
+        LOG_ERROR("Request handling exception: " + std::string(e.what()));
         response = HttpResponse::internalServerError();
     }
 
@@ -382,6 +406,9 @@ void HttpServer::handleClient(int clientSocket, const std::string& clientIp, int
     std::string responseStr = response.toString();
     sendData(clientSocket, responseStr.c_str(), responseStr.size());
 
+    // 计算响应体大小
+    size_t responseSize = 0;
+
     // 步骤4：发送响应体
     if (!response.getFilePath().empty() && response.getStatusCode() == HttpResponse::STATUS_200_OK) {
         // 发送文件内容
@@ -389,20 +416,34 @@ void HttpServer::handleClient(int clientSocket, const std::string& clientIp, int
         if (fileFd >= 0) {
             char buffer[8192];  // 8KB读取缓冲区
             ssize_t bytesRead;
-            
+
             // 分块读取文件并发送
             while ((bytesRead = read(fileFd, buffer, sizeof(buffer))) > 0) {
                 sendData(clientSocket, buffer, bytesRead);
+                responseSize += bytesRead;
             }
             close(fileFd);
         }
     } else if (!response.getBody().empty()) {
         // 发送内存中的响应体
         sendData(clientSocket, response.getBody().c_str(), response.getBody().size());
+        responseSize = response.getBody().size();
     }
 
     // 步骤5：关闭客户端连接
     close(clientSocket);
+
+    // 计算处理耗时
+    auto endTime = std::chrono::steady_clock::now();
+    auto duration = std::chrono::duration_cast<std::chrono::microseconds>(endTime - startTime);
+    double durationMs = duration.count() / 1000.0;
+
+    // 记录访问日志
+    std::string method = HttpRequest::methodToString(request.getMethod());
+    std::string url = request.getUrl();
+    int statusCode = response.getStatusCode();
+
+    LOG_ACCESS(clientIp, method, url, statusCode, responseSize, durationMs);
 }
 
 /**
@@ -516,7 +557,7 @@ HttpResponse HttpServer::handleStaticFile(const HttpRequest& request) const {
     struct stat st;
     if (stat(filePath.c_str(), &st) < 0) {
         // 文件不存在
-        std::cerr << "File not found: " << filePath << std::endl;
+        LOG_WARN("File not found: " + filePath);
         return HttpResponse::notFound();
     }
 
@@ -773,4 +814,119 @@ ssize_t HttpServer::sendData(int socket, const char* data, size_t size) const {
     }
 
     return totalSent;
+}
+
+/**
+ * @brief 处理POST请求
+ * 
+ * 处理POST请求，支持以下功能：
+ * - 表单数据解析（application/x-www-form-urlencoded）
+ * - API端点处理（/api/echo）
+ * - 返回JSON格式的响应
+ * 
+ * @param request 客户端POST请求对象
+ * @return HttpResponse POST响应对象
+ */
+HttpResponse HttpServer::handlePostRequest(const HttpRequest& request) const {
+    HttpResponse response;
+    response.setStatusCode(HttpResponse::STATUS_200_OK);
+    response.addHeader("Content-Type", "application/json; charset=utf-8");
+
+    std::string path = request.getPath();
+    
+    // 处理 /api/echo 端点 - 用于测试POST请求
+    if (path == "/api/echo") {
+        // 构建JSON响应
+        std::ostringstream json;
+        json << "{\n";
+        json << "  \"method\": \"POST\",\n";
+        json << "  \"path\": \"" << path << "\",\n";
+        json << "  \"contentType\": \"" << request.getContentType() << "\",\n";
+        json << "  \"body\": \"" << request.getBody() << "\",\n";
+        
+        // 解析并输出表单数据
+        auto formData = request.parseFormData();
+        json << "  \"formData\": {\n";
+        bool first = true;
+        for (const auto& pair : formData) {
+            if (!first) json << ",\n";
+            json << "    \"" << pair.first << "\": \"" << pair.second << "\"";
+            first = false;
+        }
+        json << "\n  }\n";
+        json << "}";
+        
+        response.setBody(json.str());
+        return response;
+    }
+    
+    // 其他POST请求返回简单的确认信息
+    std::ostringstream json;
+    json << "{\n";
+    json << "  \"status\": \"success\",\n";
+    json << "  \"message\": \"POST request received\",\n";
+    json << "  \"path\": \"" << path << "\",\n";
+    json << "  \"bodyLength\": " << request.getBody().length() << "\n";
+    json << "}";
+    
+    response.setBody(json.str());
+    return response;
+}
+
+/**
+ * @brief 处理API Echo端点
+ *
+ * 处理 /api/echo 请求，返回请求信息（用于测试）。
+ * 支持GET和POST请求，返回解析后的查询参数或表单数据。
+ *
+ * @param request 客户端请求对象
+ * @return HttpResponse JSON响应对象
+ */
+HttpResponse HttpServer::handleApiEcho(const HttpRequest& request) const {
+    HttpResponse response;
+    response.setStatusCode(HttpResponse::STATUS_200_OK);
+    response.addHeader("Content-Type", "application/json; charset=utf-8");
+
+    std::string path = request.getPath();
+    std::string method = HttpRequest::methodToString(request.getMethod());
+
+    // 构建JSON响应
+    std::ostringstream json;
+    json << "{\n";
+    json << "  \"method\": \"" << method << "\",\n";
+    json << "  \"path\": \"" << path << "\",\n";
+    json << "  \"url\": \"" << request.getUrl() << "\",\n";
+
+    // 解析并输出查询参数
+    auto queryParams = request.parseQueryParams();
+    json << "  \"queryParams\": {\n";
+    bool first = true;
+    for (const auto& pair : queryParams) {
+        if (!first) json << ",\n";
+        json << "    \"" << pair.first << "\": \"" << pair.second << "\"";
+        first = false;
+    }
+    json << "\n  }";
+
+    // 如果是POST请求，也输出表单数据
+    if (request.getMethod() == HttpRequest::METHOD_POST) {
+        json << ",\n";
+        json << "  \"contentType\": \"" << request.getContentType() << "\",\n";
+        json << "  \"body\": \"" << request.getBody() << "\",\n";
+
+        auto formData = request.parseFormData();
+        json << "  \"formData\": {\n";
+        first = true;
+        for (const auto& pair : formData) {
+            if (!first) json << ",\n";
+            json << "    \"" << pair.first << "\": \"" << pair.second << "\"";
+            first = false;
+        }
+        json << "\n  }";
+    }
+
+    json << "\n}";
+
+    response.setBody(json.str());
+    return response;
 }

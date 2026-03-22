@@ -21,6 +21,9 @@ class ThreadPool;
 class HttpRequest;
 class HttpResponse;
 
+// 包含日志系统头文件
+#include "../logger/logger.h"
+
 /**
  * @brief HTTP服务器类
  * 
@@ -241,6 +244,26 @@ private:
     HttpResponse handleDirectory(const std::string& dirPath) const;
 
     /**
+     * @brief 处理POST请求
+     * 
+     * 处理POST请求，支持表单数据解析和API端点。
+     * 
+     * @param request 客户端POST请求对象
+     * @return HttpResponse POST响应对象
+     */
+    HttpResponse handlePostRequest(const HttpRequest& request) const;
+
+    /**
+     * @brief 处理API Echo端点
+     * 
+     * 处理 /api/echo 请求，返回请求信息（用于测试）。
+     * 
+     * @param request 客户端请求对象
+     * @return HttpResponse JSON响应对象
+     */
+    HttpResponse handleApiEcho(const HttpRequest& request) const;
+
+    /**
      * @brief URL解码
      * 
      * 将URL编码的字符串转换为普通字符串。
@@ -328,6 +351,9 @@ private:
 
     /** 线程池智能指针 */
     std::unique_ptr<ThreadPool> m_threadPool;
+
+    /** 接受客户端连接的线程 */
+    std::thread m_acceptThread;
 
     /** 自定义请求处理函数 */
     RequestHandler m_requestHandler;
