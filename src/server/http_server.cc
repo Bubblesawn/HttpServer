@@ -30,6 +30,11 @@
 #include <cctype>           // 字符处理
 #include <iostream>          // 输入输出
 
+// 为兼容旧版本系统，定义EPOLLRDHUP（如果未定义）
+#ifndef EPOLLRDHUP
+#define EPOLLRDHUP 0x2000
+#endif
+
 /**
  * @brief 构造函数
  * 
@@ -44,13 +49,14 @@ HttpServer::HttpServer(const std::string& ip, int port)
     , m_docRoot("./html_docs")    // 默认文档根目录
     , m_numThreads(4)             // 默认4个工作线程
     , m_serverSocket(-1)         // 初始化为无效socket
-    , m_running(false) {          // 初始状态为未运行
+    , m_running(false)            // 初始状态为未运行
+    , m_useEpoll(true) {          // 默认启用epoll模式
     /**
      * @brief 忽略SIGPIPE信号
-     * 
+     *
      * 当向已关闭的socket写入数据时，进程会收到SIGPIPE信号并终止。
      * 忽略该信号可以防止这种情况，让write返回错误码而不是终止进程。
-     * 
+     *
      * 常见场景：客户端提前关闭连接，但服务器仍在发送数据
      */
     signal(SIGPIPE, SIG_IGN);
@@ -133,20 +139,65 @@ bool HttpServer::start() {
 
     // 设置服务器为运行状态
     m_running.store(true);
-    
-    // 创建线程池
-    m_threadPool = std::make_unique<ThreadPool>(m_numThreads);
 
-    // 启动接受连接的线程
-    m_acceptThread = std::thread(&HttpServer::acceptConnections, this);
-    
+    // 根据模式选择启动方式
+    if (m_useEpoll) {
+        // ========== epoll模式 ==========
+        // 创建epoll管理器
+        m_epollManager = std::make_unique<EpollManager>();
+        if (!m_epollManager->create()) {
+            LOG_ERROR("Failed to create epoll instance");
+            close(m_serverSocket);
+            m_serverSocket = -1;
+            m_running.store(false);
+            return false;
+        }
+
+        // 设置服务器socket为非阻塞模式
+        if (!EpollManager::setNonBlocking(m_serverSocket)) {
+            LOG_ERROR("Failed to set server socket to non-blocking mode");
+            m_epollManager->closeEpoll();
+            close(m_serverSocket);
+            m_serverSocket = -1;
+            m_running.store(false);
+            return false;
+        }
+
+        // 添加服务器socket到epoll监听（水平触发模式，避免遗漏连接）
+        auto serverCallback = [this](int fd, uint32_t events) {
+            this->handleServerRead(fd, events);
+        };
+        if (!m_epollManager->addFd(m_serverSocket, EpollEventType::READ, serverCallback, false)) {
+            LOG_ERROR("Failed to add server socket to epoll");
+            m_epollManager->closeEpoll();
+            close(m_serverSocket);
+            m_serverSocket = -1;
+            m_running.store(false);
+            return false;
+        }
+
+        // 启动epoll事件处理线程
+        m_epollThread = std::thread(&HttpServer::epollEventLoop, this);
+
+        LOG_INFO("Server started on " + m_ip + ":" + std::to_string(m_port));
+        LOG_INFO("Document root: " + m_docRoot);
+        LOG_INFO("Mode: epoll (event-driven)");
+    } else {
+        // ========== 传统线程池模式 ==========
+        // 创建线程池
+        m_threadPool = std::make_unique<ThreadPool>(m_numThreads);
+
+        // 启动接受连接的线程
+        m_acceptThread = std::thread(&HttpServer::acceptConnections, this);
+
+        LOG_INFO("Server started on " + m_ip + ":" + std::to_string(m_port));
+        LOG_INFO("Document root: " + m_docRoot);
+        LOG_INFO("Thread pool size: " + std::to_string(m_numThreads));
+        LOG_INFO("Mode: thread pool (one-thread-per-connection)");
+    }
+
     // 短暂等待让线程启动
     std::this_thread::sleep_for(std::chrono::milliseconds(100));
-
-    // 输出启动信息
-    LOG_INFO("Server started on " + m_ip + ":" + std::to_string(m_port));
-    LOG_INFO("Document root: " + m_docRoot);
-    LOG_INFO("Thread pool size: " + std::to_string(m_numThreads));
 
     return true;
 }
@@ -176,15 +227,44 @@ void HttpServer::stop() {
         m_serverSocket = -1;
     }
 
-    // 等待接受连接的线程结束
-    if (m_acceptThread.joinable()) {
-        m_acceptThread.join();
-    }
+    if (m_useEpoll) {
+        // ========== epoll模式停止 ==========
+        // 停止epoll事件循环
+        if (m_epollManager) {
+            m_epollManager->stop();
+        }
 
-    // 关闭线程池，等待所有任务完成
-    if (m_threadPool) {
-        m_threadPool->shutdown();
-        m_threadPool.reset();  // 释放智能指针
+        // 等待epoll事件处理线程结束
+        if (m_epollThread.joinable()) {
+            m_epollThread.join();
+        }
+
+        // 关闭所有客户端连接
+        {
+            std::lock_guard<std::mutex> lock(m_clientInfoMutex);
+            for (auto& pair : m_clientInfoMap) {
+                close(pair.first);
+            }
+            m_clientInfoMap.clear();
+        }
+
+        // 关闭epoll管理器
+        if (m_epollManager) {
+            m_epollManager->closeEpoll();
+            m_epollManager.reset();
+        }
+    } else {
+        // ========== 传统线程池模式停止 ==========
+        // 等待接受连接的线程结束
+        if (m_acceptThread.joinable()) {
+            m_acceptThread.join();
+        }
+
+        // 关闭线程池，等待所有任务完成
+        if (m_threadPool) {
+            m_threadPool->shutdown();
+            m_threadPool.reset();  // 释放智能指针
+        }
     }
 
     LOG_INFO("Server stopped");
@@ -345,15 +425,170 @@ void HttpServer::acceptConnections() {
 }
 
 /**
+ * @brief epoll事件循环
+ *
+ * 在独立线程中运行，持续调用epoll_wait等待并处理IO事件。
+ * 这是epoll模式的核心事件循环。
+ */
+void HttpServer::epollEventLoop() {
+    LOG_INFO("Epoll event loop started");
+
+    while (m_running.load() && m_epollManager && m_epollManager->isCreated()) {
+        // 等待事件，超时时间100ms（用于定期检查running状态）
+        int nfds = m_epollManager->waitAndDispatch(100);
+
+        if (nfds < 0) {
+            LOG_ERROR("Epoll wait error");
+            break;
+        }
+
+        // 可以在这里添加额外的处理逻辑，如定时任务等
+    }
+
+    LOG_INFO("Epoll event loop stopped");
+}
+
+/**
+ * @brief 处理服务器socket可读事件（epoll模式）
+ *
+ * 当epoll检测到服务器socket可读时调用，表示有新连接到来。
+ * 接受所有可用的新连接（非阻塞模式可能一次有多个）。
+ *
+ * @param serverSocket 服务器socket描述符
+ * @param events epoll事件标志
+ */
+void HttpServer::handleServerRead(int serverSocket, uint32_t events) {
+    // 检查错误事件
+    if (events & (EPOLLERR | EPOLLHUP)) {
+        LOG_ERROR("Error on server socket");
+        return;
+    }
+
+    // 接受所有可用的新连接（非阻塞accept）
+    while (m_running.load()) {
+        struct sockaddr_in clientAddr;
+        socklen_t clientAddrLen = sizeof(clientAddr);
+
+        int clientSocket = accept(serverSocket,
+                                 (struct sockaddr*)&clientAddr,
+                                 &clientAddrLen);
+
+        if (clientSocket < 0) {
+            // EAGAIN/EWOULDBLOCK表示没有更多连接了
+            if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                break;
+            }
+            // EINTR表示被信号中断，继续尝试
+            if (errno == EINTR) {
+                continue;
+            }
+            perror("accept");
+            break;
+        }
+
+        // 获取客户端IP地址和端口
+        char clientIp[INET_ADDRSTRLEN];
+        inet_ntop(AF_INET, &clientAddr.sin_addr, clientIp, sizeof(clientIp));
+        int clientPort = ntohs(clientAddr.sin_port);
+
+        LOG_INFO("Client connected: " + std::string(clientIp) + ":" + std::to_string(clientPort));
+
+        // 设置客户端socket为非阻塞模式
+        if (!EpollManager::setNonBlocking(clientSocket)) {
+            LOG_ERROR("Failed to set client socket to non-blocking mode");
+            close(clientSocket);
+            continue;
+        }
+
+        // 保存客户端信息
+        {
+            std::lock_guard<std::mutex> lock(m_clientInfoMutex);
+            m_clientInfoMap[clientSocket] = {std::string(clientIp), clientPort, ""};
+        }
+
+        // 添加客户端socket到epoll监听（边缘触发模式）
+        auto clientCallback = [this](int fd, uint32_t ev) {
+            this->handleClientRead(fd, ev);
+        };
+
+        if (!m_epollManager->addFd(clientSocket, EpollEventType::READ, clientCallback, true)) {
+            LOG_ERROR("Failed to add client socket to epoll");
+            close(clientSocket);
+            std::lock_guard<std::mutex> lock(m_clientInfoMutex);
+            m_clientInfoMap.erase(clientSocket);
+            continue;
+        }
+    }
+}
+
+/**
+ * @brief 处理客户端可读事件（epoll模式）
+ *
+ * 当epoll检测到客户端socket可读时调用。
+ * 在边缘触发(ET)模式下，必须循环读取直到EAGAIN，确保读完所有数据。
+ *
+ * @param clientSocket 客户端socket描述符
+ * @param events epoll事件标志
+ */
+void HttpServer::handleClientRead(int clientSocket, uint32_t events) {
+    // 检查错误或断开连接事件
+    if (events & (EPOLLERR | EPOLLHUP | EPOLLRDHUP)) {
+        LOG_INFO("Client disconnected or error on fd: " + std::to_string(clientSocket));
+        cleanupClient(clientSocket);
+        return;
+    }
+
+    // 获取客户端信息
+    ClientInfo clientInfo;
+    {
+        std::lock_guard<std::mutex> lock(m_clientInfoMutex);
+        auto it = m_clientInfoMap.find(clientSocket);
+        if (it == m_clientInfoMap.end()) {
+            LOG_WARN("Client info not found for fd: " + std::to_string(clientSocket));
+            cleanupClient(clientSocket);
+            return;
+        }
+        clientInfo = it->second;
+    }
+
+    // 处理请求（复用原有的handleClient逻辑）
+    handleClient(clientSocket, clientInfo.ip, clientInfo.port);
+
+    // 处理完成后关闭连接（HTTP短连接模式）
+    cleanupClient(clientSocket);
+}
+
+/**
+ * @brief 清理客户端连接资源
+ *
+ * 从epoll中移除、关闭socket、移除客户端信息
+ *
+ * @param clientSocket 客户端socket描述符
+ */
+void HttpServer::cleanupClient(int clientSocket) {
+    // 从epoll中移除
+    if (m_epollManager) {
+        m_epollManager->removeFd(clientSocket);
+    }
+    // 关闭socket
+    close(clientSocket);
+    // 移除客户端信息
+    {
+        std::lock_guard<std::mutex> lock(m_clientInfoMutex);
+        m_clientInfoMap.erase(clientSocket);
+    }
+}
+
+/**
  * @brief 处理客户端请求
- * 
+ *
  * 完整的请求处理流程：
  * 1. 解析HTTP请求
  * 2. 调用处理函数生成响应
  * 3. 发送响应头
  * 4. 发送响应体（文件或内存内容）
  * 5. 关闭客户端连接
- * 
+ *
  * @param clientSocket 客户端socket描述符
  * @param clientIp 客户端IP地址
  * @param clientPort 客户端端口号
@@ -733,10 +968,12 @@ bool HttpServer::isPathTraversal(const std::string& path) const {
 
 /**
  * @brief 从socket读取一行
- * 
+ *
  * 读取直到遇到换行符（\\n）的数据。
  * 处理不同换行符格式：\\n, \\r\\n, \\r
- * 
+ *
+ * 在epoll边缘触发(ET)模式下，必须使用非阻塞IO并处理EAGAIN错误。
+ *
  * @param socket socket描述符
  * @param line 存储读取结果的字符串
  * @return int 读取的字节数，-1表示错误或连接关闭
@@ -749,8 +986,21 @@ int HttpServer::readLine(int socket, std::string& line) const {
     // 按字节读取
     while (true) {
         n = read(socket, &ch, 1);
-        if (n <= 0) {
-            // 连接关闭或出错
+        if (n < 0) {
+            // 非阻塞模式下，EAGAIN表示数据已读完
+            if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                // 如果已经读到了一些数据，返回成功
+                // 否则返回-1表示需要等待更多数据
+                return line.empty() ? -1 : line.length();
+            }
+            // 其他错误
+            if (line.empty()) {
+                return -1;
+            }
+            return line.length();
+        }
+        if (n == 0) {
+            // 连接关闭
             return line.empty() ? -1 : line.length();
         }
 
@@ -758,7 +1008,7 @@ int HttpServer::readLine(int socket, std::string& line) const {
             // 换行符，行的结束
             break;
         }
-        
+
         // 跳过\r（处理\r\n和\r的情况）
         if (ch != '\r') {
             line += ch;
@@ -770,9 +1020,11 @@ int HttpServer::readLine(int socket, std::string& line) const {
 
 /**
  * @brief 从socket读取指定数量的数据
- * 
+ *
  * 确保读取到指定数量的字节（除非遇到EOF或错误）。
- * 
+ *
+ * 在epoll边缘触发(ET)模式下，必须使用非阻塞IO并处理EAGAIN错误。
+ *
  * @param socket socket描述符
  * @param buffer 数据缓冲区
  * @param size 要读取的字节数
@@ -785,8 +1037,16 @@ ssize_t HttpServer::readData(int socket, char* buffer, size_t size) const {
     // 循环读取直到达到指定数量
     while (totalRead < size) {
         n = read(socket, buffer + totalRead, size - totalRead);
-        if (n <= 0) {
-            // EOF或错误，停止读取
+        if (n < 0) {
+            // 非阻塞模式下，EAGAIN表示数据已读完
+            if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                break;
+            }
+            // 其他错误
+            break;
+        }
+        if (n == 0) {
+            // EOF，连接关闭
             break;
         }
         totalRead += n;
