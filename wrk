@@ -1,0 +1,6 @@
+#!/bin/bash
+# wrk wrapper - 使用系统自带的 LuaJIT 库避免兼容性问题
+# 解决: PANIC: unprotected error in call to Lua API (attempt to index a nil value)
+
+export LD_LIBRARY_PATH=/usr/lib/x86_64-linux-gnu:$LD_LIBRARY_PATH
+exec /usr/bin/wrk "$@"
