@@ -10,6 +10,7 @@
 #include "../request/http_request.h"
 #include "../response/http_response.h"
 #include "../thread/thread_pool.h"
+#include "../cache/file_cache.h"
 #include <thread>
 
 // POSIX网络编程头文件
@@ -50,7 +51,8 @@ HttpServer::HttpServer(const std::string& ip, int port)
     , m_numThreads(4)             // 默认4个工作线程
     , m_serverSocket(-1)         // 初始化为无效socket
     , m_running(false)            // 初始状态为未运行
-    , m_useEpoll(true) {          // 默认启用epoll模式
+    , m_useEpoll(true)           // 默认启用epoll模式
+    , m_fileCache(nullptr) {     // 文件缓存初始化为nullptr
     /**
      * @brief 忽略SIGPIPE信号
      *
@@ -146,6 +148,9 @@ bool HttpServer::start() {
         // 创建线程池（用于处理请求）
         m_threadPool = std::make_unique<ThreadPool>(m_numThreads);
 
+        // 创建文件缓存
+        m_fileCache = std::make_unique<FileCache>();
+
         // 创建epoll管理器
         m_epollManager = std::make_unique<EpollManager>();
         if (!m_epollManager->create()) {
@@ -190,6 +195,9 @@ bool HttpServer::start() {
         // ========== 传统线程池模式 ==========
         // 创建线程池
         m_threadPool = std::make_unique<ThreadPool>(m_numThreads);
+
+        // 创建文件缓存
+        m_fileCache = std::make_unique<FileCache>();
 
         // 启动接受连接的线程
         m_acceptThread = std::thread(&HttpServer::acceptConnections, this);
@@ -247,6 +255,11 @@ void HttpServer::stop() {
         if (m_threadPool) {
             m_threadPool->shutdown();
             m_threadPool.reset();
+        }
+
+        // 关闭文件缓存
+        if (m_fileCache) {
+            m_fileCache.reset();
         }
 
         // 关闭所有客户端连接
@@ -341,6 +354,109 @@ void HttpServer::setNumThreads(int numThreads) {
  */
 int HttpServer::getNumThreads() const {
     return m_numThreads;
+}
+
+/**
+ * @brief 启用或禁用静态文件缓存
+ *
+ * @param enabled true启用缓存，false禁用缓存
+ */
+void HttpServer::setCacheEnabled(bool enabled) {
+    if (m_fileCache) {
+        m_fileCache->setEnabled(enabled);
+    }
+}
+
+/**
+ * @brief 检查缓存是否启用
+ *
+ * @return bool 缓存启用返回true，否则返回false
+ */
+bool HttpServer::isCacheEnabled() const {
+    if (m_fileCache) {
+        return m_fileCache->isEnabled();
+    }
+    return false;
+}
+
+/**
+ * @brief 设置最大缓存大小
+ *
+ * @param maxSize 最大缓存大小（字节）
+ */
+void HttpServer::setCacheMaxSize(size_t maxSize) {
+    if (m_fileCache) {
+        m_fileCache->setMaxSize(maxSize);
+    }
+}
+
+/**
+ * @brief 获取最大缓存大小
+ *
+ * @return size_t 最大缓存大小（字节）
+ */
+size_t HttpServer::getCacheMaxSize() const {
+    if (m_fileCache) {
+        return m_fileCache->getMaxSize();
+    }
+    return 0;
+}
+
+/**
+ * @brief 设置单文件最大缓存大小
+ *
+ * @param maxSize 单文件最大缓存大小（字节）
+ */
+void HttpServer::setCacheMaxFileSize(size_t maxSize) {
+    if (m_fileCache) {
+        m_fileCache->setMaxFileSize(maxSize);
+    }
+}
+
+/**
+ * @brief 获取单文件最大缓存大小
+ *
+ * @return size_t 单文件最大缓存大小（字节）
+ */
+size_t HttpServer::getCacheMaxFileSize() const {
+    if (m_fileCache) {
+        return m_fileCache->getMaxFileSize();
+    }
+    return 0;
+}
+
+/**
+ * @brief 获取缓存统计信息
+ *
+ * @return std::string 缓存统计信息的JSON格式字符串
+ */
+std::string HttpServer::getCacheStats() const {
+    if (!m_fileCache) {
+        return "{}";
+    }
+
+    std::ostringstream oss;
+    oss << "{";
+    oss << "\"enabled\":" << (m_fileCache->isEnabled() ? "true" : "false") << ",";
+    oss << "\"maxSize\":" << m_fileCache->getMaxSize() << ",";
+    oss << "\"currentSize\":" << m_fileCache->getCurrentSize() << ",";
+    oss << "\"maxFileSize\":" << m_fileCache->getMaxFileSize() << ",";
+    oss << "\"cacheCount\":" << m_fileCache->getCacheCount() << ",";
+    oss << "\"hitCount\":" << m_fileCache->getHitCount() << ",";
+    oss << "\"missCount\":" << m_fileCache->getMissCount() << ",";
+    oss << "\"hitRate\":" << m_fileCache->getHitRate();
+    oss << "}";
+
+    return oss.str();
+}
+
+/**
+ * @brief 清空文件缓存
+ */
+void HttpServer::clearCache() {
+    if (m_fileCache) {
+        m_fileCache->clear();
+    }
 }
 
 /**
@@ -679,18 +795,50 @@ void HttpServer::handleClient(int clientSocket, const std::string& clientIp, int
 
     // 步骤4：发送响应体
     if (!response.getFilePath().empty() && response.getStatusCode() == HttpResponse::STATUS_200_OK) {
-        // 发送文件内容
-        int fileFd = open(response.getFilePath().c_str(), O_RDONLY);
-        if (fileFd >= 0) {
-            char buffer[8192];  // 8KB读取缓冲区
-            ssize_t bytesRead;
+        // 优先尝试从缓存获取文件内容
+        if (m_fileCache && m_fileCache->isEnabled()) {
+            auto cachedContent = m_fileCache->get(response.getFilePath());
+            if (cachedContent) {
+                // 缓存命中，直接发送缓存内容
+                sendData(clientSocket, cachedContent->c_str(), cachedContent->size());
+                responseSize = cachedContent->size();
+            } else {
+                // 缓存未命中，从磁盘读取文件
+                int fileFd = open(response.getFilePath().c_str(), O_RDONLY);
+                if (fileFd >= 0) {
+                    char buffer[8192];
+                    ssize_t bytesRead;
+                    std::string fileContent;
 
-            // 分块读取文件并发送
-            while ((bytesRead = read(fileFd, buffer, sizeof(buffer))) > 0) {
-                sendData(clientSocket, buffer, bytesRead);
-                responseSize += bytesRead;
+                    // 读取文件内容
+                    while ((bytesRead = read(fileFd, buffer, sizeof(buffer))) > 0) {
+                        fileContent.append(buffer, bytesRead);
+                        sendData(clientSocket, buffer, bytesRead);
+                        responseSize += bytesRead;
+                    }
+
+                    // 获取文件修改时间并放入缓存
+                    struct stat fileStat;
+                    if (fstat(fileFd, &fileStat) == 0) {
+                        m_fileCache->put(response.getFilePath(), fileContent, fileStat.st_mtime);
+                    }
+
+                    close(fileFd);
+                }
             }
-            close(fileFd);
+        } else {
+            // 缓存未启用，直接从磁盘读取并发送
+            int fileFd = open(response.getFilePath().c_str(), O_RDONLY);
+            if (fileFd >= 0) {
+                char buffer[8192];
+                ssize_t bytesRead;
+
+                while ((bytesRead = read(fileFd, buffer, sizeof(buffer))) > 0) {
+                    sendData(clientSocket, buffer, bytesRead);
+                    responseSize += bytesRead;
+                }
+                close(fileFd);
+            }
         }
     } else if (!response.getBody().empty()) {
         // 发送内存中的响应体

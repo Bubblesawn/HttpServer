@@ -23,6 +23,7 @@ class ThreadPool;
 class HttpRequest;
 class HttpResponse;
 class EpollManager;  // epoll事件管理器前向声明
+class FileCache;     // 文件缓存前向声明
 
 // 包含日志系统头文件
 #include "../logger/logger.h"
@@ -164,6 +165,60 @@ public:
      * @return int 当前配置的线程数量
      */
     int getNumThreads() const;
+
+    /**
+     * @brief 启用或禁用静态文件缓存
+     * 
+     * @param enabled true启用缓存，false禁用缓存
+     */
+    void setCacheEnabled(bool enabled);
+
+    /**
+     * @brief 检查缓存是否启用
+     * 
+     * @return bool 缓存启用返回true，否则返回false
+     */
+    bool isCacheEnabled() const;
+
+    /**
+     * @brief 设置最大缓存大小
+     * 
+     * @param maxSize 最大缓存大小（字节）
+     */
+    void setCacheMaxSize(size_t maxSize);
+
+    /**
+     * @brief 获取最大缓存大小
+     * 
+     * @return size_t 最大缓存大小（字节）
+     */
+    size_t getCacheMaxSize() const;
+
+    /**
+     * @brief 设置单文件最大缓存大小
+     * 
+     * @param maxSize 单文件最大缓存大小（字节）
+     */
+    void setCacheMaxFileSize(size_t maxSize);
+
+    /**
+     * @brief 获取单文件最大缓存大小
+     * 
+     * @return size_t 单文件最大缓存大小（字节）
+     */
+    size_t getCacheMaxFileSize() const;
+
+    /**
+     * @brief 获取缓存统计信息
+     * 
+     * @return std::string 缓存统计信息的JSON格式字符串
+     */
+    std::string getCacheStats() const;
+
+    /**
+     * @brief 清空文件缓存
+     */
+    void clearCache();
 
     /**
      * @brief 设置自定义请求处理函数
@@ -437,6 +492,11 @@ private:
 
     /** 客户端信息映射的互斥锁 */
     std::mutex m_clientInfoMutex;
+
+    //================== 文件缓存相关成员变量 ==================
+
+    /** 文件缓存智能指针 */
+    std::unique_ptr<FileCache> m_fileCache;
 };
 
 #endif // HTTP_SERVER_H
