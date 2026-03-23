@@ -221,6 +221,17 @@ public:
     std::string toString() const;
 
     /**
+     * @brief 构建HTTP响应头字符串（带指定的Content-Length）
+     *
+     * 与toString()类似，但允许指定Content-Length值。
+     * 用于缓存场景下，确保Content-Length与实际发送内容一致。
+     *
+     * @param contentLength 实际响应体大小（字节）
+     * @return std::string HTTP响应头字符串（不包含响应体）
+     */
+    std::string buildHeaderString(size_t contentLength) const;
+
+    /**
      * @brief 将状态码转换为字符串形式
      * 
      * 静态方法，将状态码枚举转换为可读的状态消息。

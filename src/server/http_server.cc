@@ -17,7 +17,9 @@
 #include <sys/socket.h>      // socket编程接口
 #include <sys/types.h>       // 数据类型定义
 #include <sys/stat.h>        // 文件状态
+#include <sys/sendfile.h>    // sendfile零拷贝
 #include <netinet/in.h>     // 网络地址结构
+#include <netinet/tcp.h>    // TCP协议选项
 #include <arpa/inet.h>      // IP地址转换
 #include <unistd.h>          // POSIX API (close, read, write等)
 #include <fcntl.h>           // 文件控制
@@ -48,7 +50,7 @@ HttpServer::HttpServer(const std::string& ip, int port)
     : m_ip(ip)
     , m_port(port)
     , m_docRoot("./html_docs")    // 默认文档根目录
-    , m_numThreads(4)             // 默认4个工作线程
+    , m_numThreads(std::thread::hardware_concurrency() * 2)  // 默认线程数为CPU核心数的2倍，提高并发处理能力
     , m_serverSocket(-1)         // 初始化为无效socket
     , m_running(false)            // 初始状态为未运行
     , m_useEpoll(true)           // 默认启用epoll模式
@@ -131,8 +133,8 @@ bool HttpServer::start() {
     }
 
     // 开始监听连接请求
-    // 128: 等待队列的最大长度
-    if (listen(m_serverSocket, 128) < 0) {
+    // SOMAXCONN: 使用系统允许的最大等待队列长度，支持高并发连接
+    if (listen(m_serverSocket, SOMAXCONN) < 0) {
         perror("listen");
         close(m_serverSocket);
         m_serverSocket = -1;
@@ -626,6 +628,17 @@ void HttpServer::handleServerRead(int serverSocket, uint32_t events) {
             continue;
         }
 
+        // 设置socket接收和发送超时时间（5秒），防止客户端长时间占用连接
+        struct timeval timeout;
+        timeout.tv_sec = 5;   // 5秒超时
+        timeout.tv_usec = 0;
+        setsockopt(clientSocket, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
+        setsockopt(clientSocket, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout));
+
+        // 启用TCP_NODELAY，禁用Nagle算法，减少小数据包延迟
+        int nodelay = 1;
+        setsockopt(clientSocket, IPPROTO_TCP, TCP_NODELAY, &nodelay, sizeof(nodelay));
+
         // 保存客户端信息
         {
             std::lock_guard<std::mutex> lock(m_clientInfoMutex);
@@ -744,39 +757,45 @@ void HttpServer::handleClient(int clientSocket, const std::string& clientIp, int
         // 步骤1：解析HTTP请求
         request = parseRequest(clientSocket);
 
-        // 步骤2：根据请求类型调用相应处理函数
-        if (m_requestHandler) {
-            // 使用自定义处理函数
-            response = m_requestHandler(request);
+        // 检查请求是否有效（如果解析失败，request会是默认构造的无效对象）
+        if (request.getMethod() == HttpRequest::METHOD_UNKNOWN || request.getUrl().empty()) {
+            response = HttpResponse::badRequest();
+            LOG_WARN("Invalid request from " + clientIp + ":" + std::to_string(clientPort));
         } else {
-            // 默认处理
-            if (request.getMethod() == HttpRequest::METHOD_GET) {
-                // 处理API端点
-                if (request.getPath() == "/api/echo") {
-                    response = handleApiEcho(request);
-                } else {
-                    // GET请求提供静态文件服务
-                    response = handleStaticFile(request);
-                }
-            } else if (request.getMethod() == HttpRequest::METHOD_HEAD) {
-                // HEAD请求处理：与GET相同，但不返回响应体
-                if (request.getPath() == "/api/echo") {
-                    response = handleApiEcho(request);
-                } else {
-                    response = handleStaticFile(request);
-                }
-                // HEAD请求不返回响应体，清空body和文件路径
-                // 注意：保留Content-Type，因为HEAD响应应该包含与GET相同的头部信息
-                std::string contentType = response.getContentType();
-                response.setBody("");
-                response.setFilePath("");
-                response.setContentType(contentType);
-            } else if (request.getMethod() == HttpRequest::METHOD_POST) {
-                // POST请求处理
-                response = handlePostRequest(request);
+            // 步骤2：根据请求类型调用相应处理函数
+            if (m_requestHandler) {
+                // 使用自定义处理函数
+                response = m_requestHandler(request);
             } else {
-                // 其他HTTP方法返回501 Not Implemented
-                response = HttpResponse::notImplemented();
+                // 默认处理
+                if (request.getMethod() == HttpRequest::METHOD_GET) {
+                    // 处理API端点
+                    if (request.getPath() == "/api/echo") {
+                        response = handleApiEcho(request);
+                    } else {
+                        // GET请求提供静态文件服务
+                        response = handleStaticFile(request);
+                    }
+                } else if (request.getMethod() == HttpRequest::METHOD_HEAD) {
+                    // HEAD请求处理：与GET相同，但不返回响应体
+                    if (request.getPath() == "/api/echo") {
+                        response = handleApiEcho(request);
+                    } else {
+                        response = handleStaticFile(request);
+                    }
+                    // HEAD请求不返回响应体，清空body和文件路径
+                    // 注意：保留Content-Type，因为HEAD响应应该包含与GET相同的头部信息
+                    std::string contentType = response.getContentType();
+                    response.setBody("");
+                    response.setFilePath("");
+                    response.setContentType(contentType);
+                } else if (request.getMethod() == HttpRequest::METHOD_POST) {
+                    // POST请求处理
+                    response = handlePostRequest(request);
+                } else {
+                    // 其他HTTP方法返回501 Not Implemented
+                    response = HttpResponse::notImplemented();
+                }
             }
         }
     } catch (const std::exception& e) {
@@ -785,65 +804,79 @@ void HttpServer::handleClient(int clientSocket, const std::string& clientIp, int
         response = HttpResponse::internalServerError();
     }
 
-    // 步骤3：发送HTTP响应
-    // 将响应对象转换为字符串格式（HTTP头）
-    std::string responseStr = response.toString();
-    sendData(clientSocket, responseStr.c_str(), responseStr.size());
-
-    // 计算响应体大小
-    size_t responseSize = 0;
-
     // 步骤4：发送响应体
+    size_t responseSize = 0;
+    std::string bodyToSend;
+    bool useCache = false;
+    bool useSendfile = false;  // 是否使用sendfile优化
+    int fileFd = -1;           // 文件描述符（用于sendfile）
+    off_t fileOffset = 0;      // 文件偏移量
+    size_t fileSize = 0;       // 文件大小
+
     if (!response.getFilePath().empty() && response.getStatusCode() == HttpResponse::STATUS_200_OK) {
         // 优先尝试从缓存获取文件内容
         if (m_fileCache && m_fileCache->isEnabled()) {
             auto cachedContent = m_fileCache->get(response.getFilePath());
             if (cachedContent) {
-                // 缓存命中，直接发送缓存内容
-                sendData(clientSocket, cachedContent->c_str(), cachedContent->size());
+                // 缓存命中，使用缓存内容
+                bodyToSend = *cachedContent;
                 responseSize = cachedContent->size();
-            } else {
-                // 缓存未命中，从磁盘读取文件
-                int fileFd = open(response.getFilePath().c_str(), O_RDONLY);
-                if (fileFd >= 0) {
-                    char buffer[8192];
-                    ssize_t bytesRead;
-                    std::string fileContent;
-
-                    // 读取文件内容
-                    while ((bytesRead = read(fileFd, buffer, sizeof(buffer))) > 0) {
-                        fileContent.append(buffer, bytesRead);
-                        sendData(clientSocket, buffer, bytesRead);
-                        responseSize += bytesRead;
-                    }
-
-                    // 获取文件修改时间并放入缓存
-                    struct stat fileStat;
-                    if (fstat(fileFd, &fileStat) == 0) {
-                        m_fileCache->put(response.getFilePath(), fileContent, fileStat.st_mtime);
-                    }
-
-                    close(fileFd);
-                }
+                useCache = true;
             }
-        } else {
-            // 缓存未启用，直接从磁盘读取并发送
-            int fileFd = open(response.getFilePath().c_str(), O_RDONLY);
-            if (fileFd >= 0) {
-                char buffer[8192];
-                ssize_t bytesRead;
+        }
 
-                while ((bytesRead = read(fileFd, buffer, sizeof(buffer))) > 0) {
-                    sendData(clientSocket, buffer, bytesRead);
-                    responseSize += bytesRead;
+        if (!useCache) {
+            // 缓存未命中，使用sendfile零拷贝优化发送文件
+            // sendfile直接在内核空间将文件内容发送到socket，避免用户空间拷贝
+            fileFd = open(response.getFilePath().c_str(), O_RDONLY);
+            if (fileFd >= 0) {
+                struct stat fileStat;
+                if (fstat(fileFd, &fileStat) == 0) {
+                    fileSize = fileStat.st_size;
+                    responseSize = fileSize;
+                    useSendfile = true;
+                    
+                    // 如果文件较小，仍然使用缓存
+                    if (m_fileCache && m_fileCache->isEnabled() && fileSize <= m_fileCache->getMaxFileSize()) {
+                        char buffer[8192];
+                        ssize_t bytesRead;
+                        std::string fileContent;
+                        lseek(fileFd, 0, SEEK_SET);  // 重置文件偏移
+                        while ((bytesRead = read(fileFd, buffer, sizeof(buffer))) > 0) {
+                            fileContent.append(buffer, bytesRead);
+                        }
+                        m_fileCache->put(response.getFilePath(), fileContent, fileStat.st_mtime);
+                        lseek(fileFd, 0, SEEK_SET);  // 重置文件偏移供sendfile使用
+                    }
                 }
-                close(fileFd);
             }
         }
     } else if (!response.getBody().empty()) {
-        // 发送内存中的响应体
-        sendData(clientSocket, response.getBody().c_str(), response.getBody().size());
-        responseSize = response.getBody().size();
+        bodyToSend = response.getBody();
+        responseSize = bodyToSend.size();
+    }
+
+    // 步骤3：发送HTTP响应
+    std::string headerStr = response.buildHeaderString(responseSize);
+    sendData(clientSocket, headerStr.c_str(), headerStr.size());
+    
+    if (useSendfile && fileFd >= 0) {
+        // 使用sendfile零拷贝发送文件内容，性能更优
+        ssize_t sent;
+        while (fileSize > 0) {
+            sent = sendfile(clientSocket, fileFd, &fileOffset, fileSize);
+            if (sent <= 0) {
+                if (errno == EINTR) {
+                    continue;  // 被信号中断，重试
+                }
+                break;  // 发送错误或连接关闭
+            }
+            fileSize -= sent;
+        }
+        close(fileFd);
+    } else if (!bodyToSend.empty()) {
+        // 使用缓存内容或普通响应体发送
+        sendData(clientSocket, bodyToSend.c_str(), bodyToSend.size());
     }
 
     // 步骤5：关闭客户端连接
@@ -886,13 +919,25 @@ HttpRequest HttpServer::parseRequest(int clientSocket) const {
 
     // 读取请求行（第一行）
     if (readLine(clientSocket, line) <= 0) {
-        return request;
+        // 如果请求行读取失败，返回空的请求对象
+        // 这会导致后续处理返回400错误，而不是默认构造的无效请求
+        return HttpRequest();
+    }
+
+    // 检查请求行是否有效（至少包含方法和URL）
+    if (line.empty()) {
+        return HttpRequest();
     }
 
     // 解析请求行：METHOD URL HTTP/VERSION
     std::istringstream requestLine(line);
     std::string method, url, version;
     requestLine >> method >> url >> version;
+
+    // 检查请求行是否完整
+    if (method.empty() || url.empty() || version.empty()) {
+        return HttpRequest();
+    }
 
     // 设置请求方法和URL
     request.setMethodString(method);

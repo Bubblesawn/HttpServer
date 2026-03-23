@@ -260,6 +260,48 @@ std::string HttpResponse::toString() const {
 }
 
 /**
+ * @brief 构建HTTP响应头字符串（带指定的Content-Length）
+ *
+ * 与toString()类似，但使用传入的contentLength参数而不是getBodySize()。
+ * 确保Content-Length与实际发送内容一致。
+ *
+ * @param contentLength 实际响应体大小（字节）
+ * @return std::string HTTP响应头字符串
+ */
+std::string HttpResponse::buildHeaderString(size_t contentLength) const {
+    std::string result;
+
+    // 1. 状态行
+    result = "HTTP/1.1 " + std::to_string(static_cast<int>(m_statusCode)) + " " + m_statusMessage + "\r\n";
+
+    // 2. Content-Type头部
+    if (!m_contentType.empty()) {
+        result += "Content-Type: " + m_contentType + "\r\n";
+    }
+
+    // 3. Server头部
+    result += "Server: CppHttpServer/1.0\r\n";
+
+    // 4. 其他自定义头部
+    for (const auto& header : m_headers) {
+        result += header.first + ": " + header.second + "\r\n";
+    }
+
+    // 5. Content-Length头部（使用传入的参数）
+    if (contentLength > 0) {
+        result += "Content-Length: " + std::to_string(contentLength) + "\r\n";
+    }
+
+    // 6. Connection头部
+    result += "Connection: Close\r\n";
+
+    // 7. 空行
+    result += "\r\n";
+
+    return result;
+}
+
+/**
  * @brief 将状态码转换为字符串形式
  * 
  * 静态方法，将状态码枚举转换为标准的状态消息文本。
