@@ -29,7 +29,9 @@ echo ""
 
 # 第一步：清理残留进程
 echo "步骤 1: 清理残留进程..."
-./cleanup.sh > /dev/null 2>&1
+# 获取脚本所在目录，用于定位 cleanup.sh
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+"$SCRIPT_DIR/cleanup.sh" > /dev/null 2>&1
 
 # 第二步：检查端口是否被占用
 echo ""
@@ -58,4 +60,6 @@ fi
 echo ""
 echo "步骤 4: 启动 HTTP 服务器..."
 echo "=========================================="
-./http_server_cpp -c "$CONFIG"
+# 获取脚本所在目录的父目录（项目根目录），用于定位 http_server_cpp
+PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+"$PROJECT_ROOT/http_server_cpp" -c "$CONFIG"
