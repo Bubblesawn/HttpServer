@@ -698,6 +698,13 @@ void HttpServer::handleClientRead(int clientSocket, uint32_t events) {
     // 从epoll中移除该fd（避免重复触发）
     m_epollManager->removeFd(clientSocket);
 
+    // 将socket设置为阻塞模式，确保能完整读取HTTP请求
+    // 因为此时已经从epoll移除，不再需要非阻塞
+    int flags = fcntl(clientSocket, F_GETFL, 0);
+    if (flags != -1) {
+        fcntl(clientSocket, F_SETFL, flags & ~O_NONBLOCK);
+    }
+
     // 将请求处理提交到线程池
     m_threadPool->enqueue([this, clientSocket, clientInfo]() {
         // 在线程池中处理请求
@@ -916,6 +923,22 @@ void HttpServer::handleClient(int clientSocket, const std::string& clientIp, int
 HttpRequest HttpServer::parseRequest(int clientSocket) const {
     HttpRequest request;
     std::string line;
+
+    // 使用select等待数据到达，设置超时时间
+    // 这可以避免在数据未到达时读取失败
+    fd_set readFds;
+    FD_ZERO(&readFds);
+    FD_SET(clientSocket, &readFds);
+    
+    struct timeval selectTimeout;
+    selectTimeout.tv_sec = 5;   // 5秒超时
+    selectTimeout.tv_usec = 0;
+    
+    int selectResult = select(clientSocket + 1, &readFds, nullptr, nullptr, &selectTimeout);
+    if (selectResult <= 0) {
+        // 超时或错误，返回空请求
+        return HttpRequest();
+    }
 
     // 读取请求行（第一行）
     if (readLine(clientSocket, line) <= 0) {
