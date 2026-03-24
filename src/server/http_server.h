@@ -314,14 +314,16 @@ private:
 
     /**
      * @brief 处理客户端请求
-     * 
+     *
      * 解析HTTP请求，调用处理函数生成响应，并发送回客户端。
-     * 
+     * 支持HTTP Keep-Alive，可在一个连接上处理多个请求。
+     *
      * @param clientSocket 客户端连接的socket描述符
      * @param clientIp 客户端IP地址
      * @param clientPort 客户端端口号
+     * @return bool 返回true表示连接应保持（Keep-Alive），false表示应关闭连接
      */
-    void handleClient(int clientSocket, const std::string& clientIp, int clientPort);
+    bool handleClient(int clientSocket, const std::string& clientIp, int clientPort);
 
     /**
      * @brief 解析HTTP请求

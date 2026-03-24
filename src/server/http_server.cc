@@ -708,9 +708,31 @@ void HttpServer::handleClientRead(int clientSocket, uint32_t events) {
     // 将请求处理提交到线程池
     m_threadPool->enqueue([this, clientSocket, clientInfo]() {
         // 在线程池中处理请求
-        this->handleClient(clientSocket, clientInfo.ip, clientInfo.port);
-        // 处理完成后关闭socket
-        close(clientSocket);
+        bool keepAlive = this->handleClient(clientSocket, clientInfo.ip, clientInfo.port);
+
+        if (keepAlive) {
+            // Keep-Alive：重新注册到epoll，等待下一个请求
+            // 将socket恢复为非阻塞模式
+            int flags = fcntl(clientSocket, F_GETFL, 0);
+            if (flags != -1) {
+                fcntl(clientSocket, F_SETFL, flags | O_NONBLOCK);
+            }
+
+            // 重新将客户端信息加入map
+            {
+                std::lock_guard<std::mutex> lock(this->m_clientInfoMutex);
+                this->m_clientInfoMap[clientSocket] = clientInfo;
+            }
+
+            // 重新注册到epoll
+            auto clientCallback = [this](int fd, uint32_t events) {
+                this->handleClientRead(fd, events);
+            };
+            this->m_epollManager->addFd(clientSocket, EpollEventType::READ, clientCallback, false);
+        } else {
+            // 非Keep-Alive或出错：关闭socket
+            close(clientSocket);
+        }
     });
 }
 
@@ -749,7 +771,7 @@ void HttpServer::cleanupClient(int clientSocket) {
  * @param clientIp 客户端IP地址
  * @param clientPort 客户端端口号
  */
-void HttpServer::handleClient(int clientSocket, const std::string& clientIp, int clientPort) {
+bool HttpServer::handleClient(int clientSocket, const std::string& clientIp, int clientPort) {
     // 记录请求开始时间
     auto startTime = std::chrono::steady_clock::now();
 
@@ -759,6 +781,8 @@ void HttpServer::handleClient(int clientSocket, const std::string& clientIp, int
     request.setClientPort(clientPort);
 
     HttpResponse response;
+    bool parseSuccess = false;
+    bool keepAlive = false;
 
     try {
         // 步骤1：解析HTTP请求
@@ -769,6 +793,7 @@ void HttpServer::handleClient(int clientSocket, const std::string& clientIp, int
             response = HttpResponse::badRequest();
             LOG_WARN("Invalid request from " + clientIp + ":" + std::to_string(clientPort));
         } else {
+            parseSuccess = true;
             // 步骤2：根据请求类型调用相应处理函数
             if (m_requestHandler) {
                 // 使用自定义处理函数
@@ -811,7 +836,29 @@ void HttpServer::handleClient(int clientSocket, const std::string& clientIp, int
         response = HttpResponse::internalServerError();
     }
 
-    // 步骤4：发送响应体
+    // 步骤3：判断是否保持连接（Keep-Alive）
+    if (parseSuccess) {
+        std::string connHeader = request.getHeader("Connection");
+        std::string version = request.getVersion();
+
+        // HTTP/1.1 默认 Keep-Alive，除非 Connection: close
+        // HTTP/1.0 默认关闭，除非 Connection: keep-alive
+        if (version == "HTTP/1.1") {
+            keepAlive = (connHeader != "close");
+        } else {
+            keepAlive = (connHeader == "keep-alive");
+        }
+
+        // 添加 Connection 响应头
+        if (keepAlive) {
+            response.addHeader("Connection", "keep-alive");
+            response.addHeader("Keep-Alive", "timeout=5, max=100");
+        } else {
+            response.addHeader("Connection", "close");
+        }
+    }
+
+    // 步骤4：准备响应体
     size_t responseSize = 0;
     std::string bodyToSend;
     bool useCache = false;
@@ -842,7 +889,7 @@ void HttpServer::handleClient(int clientSocket, const std::string& clientIp, int
                     fileSize = fileStat.st_size;
                     responseSize = fileSize;
                     useSendfile = true;
-                    
+
                     // 如果文件较小，仍然使用缓存
                     if (m_fileCache && m_fileCache->isEnabled() && fileSize <= m_fileCache->getMaxFileSize()) {
                         char buffer[8192];
@@ -863,10 +910,12 @@ void HttpServer::handleClient(int clientSocket, const std::string& clientIp, int
         responseSize = bodyToSend.size();
     }
 
-    // 步骤3：发送HTTP响应
+    // 步骤5：发送HTTP响应
     std::string headerStr = response.buildHeaderString(responseSize);
-    sendData(clientSocket, headerStr.c_str(), headerStr.size());
-    
+    if (sendData(clientSocket, headerStr.c_str(), headerStr.size()) <= 0) {
+        keepAlive = false;  // 发送失败，关闭连接
+    }
+
     if (useSendfile && fileFd >= 0) {
         // 使用sendfile零拷贝发送文件内容，性能更优
         ssize_t sent;
@@ -876,18 +925,18 @@ void HttpServer::handleClient(int clientSocket, const std::string& clientIp, int
                 if (errno == EINTR) {
                     continue;  // 被信号中断，重试
                 }
-                break;  // 发送错误或连接关闭
+                keepAlive = false;  // 发送失败，关闭连接
+                break;
             }
             fileSize -= sent;
         }
         close(fileFd);
     } else if (!bodyToSend.empty()) {
         // 使用缓存内容或普通响应体发送
-        sendData(clientSocket, bodyToSend.c_str(), bodyToSend.size());
+        if (sendData(clientSocket, bodyToSend.c_str(), bodyToSend.size()) <= 0) {
+            keepAlive = false;  // 发送失败，关闭连接
+        }
     }
-
-    // 步骤5：关闭客户端连接
-    close(clientSocket);
 
     // 计算处理耗时
     auto endTime = std::chrono::steady_clock::now();
@@ -900,6 +949,8 @@ void HttpServer::handleClient(int clientSocket, const std::string& clientIp, int
     int statusCode = response.getStatusCode();
 
     LOG_ACCESS(clientIp, method, url, statusCode, responseSize, durationMs);
+
+    return keepAlive;
 }
 
 /**
@@ -949,9 +1000,10 @@ HttpRequest HttpServer::parseRequest(int clientSocket) const {
         return HttpRequest();
     }
 
-    // 设置请求方法和URL
+    // 设置请求方法、URL和HTTP版本
     request.setMethodString(method);
     request.setUrl(url);
+    request.setVersion(version);
 
     // 读取HTTP头部
     while (readLine(clientSocket, line) > 0) {

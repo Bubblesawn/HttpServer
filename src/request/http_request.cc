@@ -206,7 +206,7 @@ int HttpRequest::getClientPort() const {
 
 /**
  * @brief 清空请求
- * 
+ *
  * 重置所有成员变量到初始状态。
  */
 void HttpRequest::clear() {
@@ -217,6 +217,25 @@ void HttpRequest::clear() {
     m_body.clear();
     m_clientIp.clear();
     m_clientPort = 0;
+    m_version.clear();
+}
+
+/**
+ * @brief 设置HTTP版本
+ *
+ * @param version HTTP版本字符串（如"HTTP/1.1"）
+ */
+void HttpRequest::setVersion(const std::string& version) {
+    m_version = version;
+}
+
+/**
+ * @brief 获取HTTP版本
+ *
+ * @return std::string HTTP版本字符串（如"HTTP/1.1"）
+ */
+std::string HttpRequest::getVersion() const {
+    return m_version;
 }
 
 /**

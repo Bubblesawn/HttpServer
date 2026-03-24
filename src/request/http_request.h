@@ -193,6 +193,20 @@ public:
     void clear();
 
     /**
+     * @brief 设置HTTP版本
+     * 
+     * @param version HTTP版本字符串（如"HTTP/1.1"）
+     */
+    void setVersion(const std::string& version);
+
+    /**
+     * @brief 获取HTTP版本
+     * 
+     * @return std::string HTTP版本字符串（如"HTTP/1.1"）
+     */
+    std::string getVersion() const;
+
+    /**
      * @brief 将字符串转换为HTTP方法枚举
      * 
      * 静态方法，不依赖于具体的HttpRequest实例。
@@ -272,6 +286,9 @@ private:
 
     /** 客户端端口号 */
     int m_clientPort;
+
+    /** HTTP版本 */
+    std::string m_version;
 };
 
 #endif // HTTP_REQUEST_H
