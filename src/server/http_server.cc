@@ -924,21 +924,8 @@ HttpRequest HttpServer::parseRequest(int clientSocket) const {
     HttpRequest request;
     std::string line;
 
-    // 使用select等待数据到达，设置超时时间
-    // 这可以避免在数据未到达时读取失败
-    fd_set readFds;
-    FD_ZERO(&readFds);
-    FD_SET(clientSocket, &readFds);
-    
-    struct timeval selectTimeout;
-    selectTimeout.tv_sec = 5;   // 5秒超时
-    selectTimeout.tv_usec = 0;
-    
-    int selectResult = select(clientSocket + 1, &readFds, nullptr, nullptr, &selectTimeout);
-    if (selectResult <= 0) {
-        // 超时或错误，返回空请求
-        return HttpRequest();
-    }
+    // 性能优化：删除多余的 select() 调用
+    // epoll 水平触发（LT）模式已确保数据就绪才调用此函数，无需再用 select() 二次确认
 
     // 读取请求行（第一行）
     if (readLine(clientSocket, line) <= 0) {
