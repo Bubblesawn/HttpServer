@@ -87,24 +87,22 @@ bool Logger::init(const std::string& accessLogPath,
     m_initialized = true;
 
     // 直接写入启动日志（不调用writeLog避免死锁）
+    // 性能优化：使用 "\n" 替代 std::endl，删除 flush() 以利用内核缓冲区
     std::string timeStr = getCurrentTime();
     std::string logLine = "[" + timeStr + "] [INFO] Logger initialized";
-    m_accessLogFile << logLine << std::endl;
-    m_accessLogFile.flush();
+    m_accessLogFile << logLine << "\n";
     if (m_consoleOutput) {
         std::cout << logLine << std::endl;
     }
 
     logLine = "[" + timeStr + "] [INFO] Access log: " + accessLogPath;
-    m_accessLogFile << logLine << std::endl;
-    m_accessLogFile.flush();
+    m_accessLogFile << logLine << "\n";
     if (m_consoleOutput) {
         std::cout << logLine << std::endl;
     }
 
     logLine = "[" + timeStr + "] [INFO] Error log: " + errorLogPath;
-    m_accessLogFile << logLine << std::endl;
-    m_accessLogFile.flush();
+    m_accessLogFile << logLine << "\n";
     if (m_consoleOutput) {
         std::cout << logLine << std::endl;
     }
@@ -225,9 +223,9 @@ void Logger::access(const std::string& clientIp,
     std::string logLine = "[" + timeStr + "] [INFO] " + oss.str();
 
     // 写入访问日志文件
+    // 性能优化：使用 "\n" 替代 std::endl，删除 flush() 以利用内核缓冲区
     if (m_accessLogFile.is_open()) {
-        m_accessLogFile << logLine << std::endl;
-        m_accessLogFile.flush();
+        m_accessLogFile << logLine << "\n";
     }
 
     // 同时输出到控制台
@@ -281,15 +279,14 @@ void Logger::writeLog(LogLevel level, const std::string& message, bool isError) 
     std::string logLine = "[" + timeStr + "] [" + levelStr + "] " + message;
 
     // 写入访问日志文件（所有级别）
+    // 性能优化：使用 "\n" 替代 std::endl，删除 flush() 以利用内核缓冲区
     if (m_accessLogFile.is_open()) {
-        m_accessLogFile << logLine << std::endl;
-        m_accessLogFile.flush();
+        m_accessLogFile << logLine << "\n";
     }
 
     // 错误日志同时写入错误日志文件
     if (isError && m_errorLogFile.is_open()) {
-        m_errorLogFile << logLine << std::endl;
-        m_errorLogFile.flush();
+        m_errorLogFile << logLine << "\n";
     }
 
     // 同时输出到控制台
