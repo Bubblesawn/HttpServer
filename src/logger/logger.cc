@@ -230,7 +230,7 @@ void Logger::access(const std::string& clientIp,
 
     // 同时输出到控制台
     if (m_consoleOutput) {
-        std::cout << logLine << std::endl;
+        std::cout << logLine << "\n";
     }
 }
 
@@ -292,9 +292,9 @@ void Logger::writeLog(LogLevel level, const std::string& message, bool isError) 
     // 同时输出到控制台
     if (m_consoleOutput) {
         if (level >= LogLevel::ERROR) {
-            std::cerr << logLine << std::endl;
+            std::cerr << logLine << "\n";
         } else {
-            std::cout << logLine << std::endl;
+            std::cout << logLine << "\n";
         }
     }
 }

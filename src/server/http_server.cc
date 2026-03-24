@@ -628,10 +628,12 @@ void HttpServer::handleServerRead(int serverSocket, uint32_t events) {
             continue;
         }
 
-        // 设置socket接收和发送超时时间（5秒），防止客户端长时间占用连接
+        // 设置socket接收超时时间：100ms
+        // ⚠️ Keep-Alive 模式下，线程池线程在阻塞 socket 上 readLine() 等待
+        // 下一个请求的数据，超时必须短，否则 500 连接会耗尽 20 个线程导致饥饿
         struct timeval timeout;
-        timeout.tv_sec = 5;   // 5秒超时
-        timeout.tv_usec = 0;
+        timeout.tv_sec = 0;
+        timeout.tv_usec = 100000;  // 100ms
         setsockopt(clientSocket, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
         setsockopt(clientSocket, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout));
 
