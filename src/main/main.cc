@@ -5,8 +5,11 @@
 #include <fstream>
 #include <sstream>
 #include <string>
+#include <filesystem>
 #include "../server/http_server.h"
 #include "../logger/logger.h"
+
+namespace fs = std::filesystem;
 
 /**
  * @brief 全局服务器实例指针
@@ -119,6 +122,72 @@ bool parseConfigFile(const std::string& configFilePath, Config& config) {
 }
 
 /**
+ * @brief 在常见路径中定位配置文件
+ *
+ * 按顺序尝试：
+ * 1. 传入路径（相对当前工作目录）
+ * 2. 可执行文件目录下同名路径
+ * 3. 可执行文件父目录下同名路径（常见于 build/ 场景）
+ *
+ * @param requestedPath 用户请求的配置路径
+ * @param argv0 程序路径
+ * @return std::string 可读取的配置文件路径；若都失败则返回原路径
+ */
+std::string resolveConfigPath(const std::string& requestedPath, const char* argv0) {
+    fs::path requested(requestedPath);
+
+    // 绝对路径直接检查
+    if (requested.is_absolute() && fs::exists(requested)) {
+        return requested.string();
+    }
+
+    // 当前工作目录
+    if (fs::exists(requested)) {
+        return requested.string();
+    }
+
+    fs::path exePath = fs::absolute(fs::path(argv0 ? argv0 : ""));
+    fs::path exeDir = exePath.has_parent_path() ? exePath.parent_path() : fs::current_path();
+
+    // 可执行文件目录
+    fs::path candidate = exeDir / requested;
+    if (fs::exists(candidate)) {
+        return candidate.string();
+    }
+
+    // 可执行文件父目录（如从 build/ 启动，配置在项目根）
+    candidate = exeDir.parent_path() / requested;
+    if (fs::exists(candidate)) {
+        return candidate.string();
+    }
+
+    // 当前工作目录父目录（常见：在 build/ 下运行，配置在 ../）
+    candidate = fs::current_path().parent_path() / requested;
+    if (fs::exists(candidate)) {
+        return candidate.string();
+    }
+
+    return requestedPath;
+}
+
+/**
+ * @brief 将相对路径转换为基于配置文件目录的绝对路径
+ */
+std::string resolvePathByConfigDir(const std::string& pathValue, const std::string& configFilePath) {
+    fs::path value(pathValue);
+    if (value.is_absolute()) {
+        return value.string();
+    }
+
+    fs::path configDir = fs::path(configFilePath).parent_path();
+    if (configDir.empty()) {
+        configDir = fs::current_path();
+    }
+
+    return (configDir / value).lexically_normal().string();
+}
+
+/**
  * @brief 打印程序使用说明
  * 
  * 显示所有可用的命令行选项及其说明。
@@ -169,6 +238,7 @@ void printVersion() {
 int main(int argc, char* argv[]) {
     /** 配置文件路径 */
     std::string configFile = "./http_server.conf";
+    std::string resolvedConfigFile = configFile;
     
     /**
      * 第一步：先解析 -c 参数获取配置文件路径
@@ -180,11 +250,14 @@ int main(int argc, char* argv[]) {
     
     int opt;
     int optionIndex = 0;
+    int oldOpterr = opterr;
+    opterr = 0;  // 首轮仅识别 -c，忽略其他参数的错误提示
     while ((opt = getopt_long(argc, argv, "c:", configOption, &optionIndex)) != -1) {
         if (opt == 'c') {
             configFile = optarg;
         }
     }
+    opterr = oldOpterr;
     
     /** 重置 optind 以便后续解析其他参数 */
     optind = 1;
@@ -193,14 +266,20 @@ int main(int argc, char* argv[]) {
      * 第二步：解析配置文件
      */
     Config config;
-    if (parseConfigFile(configFile, config)) {
-        std::cout << "Loaded config from: " << configFile << std::endl;
+    resolvedConfigFile = resolveConfigPath(configFile, argv[0]);
+    if (parseConfigFile(resolvedConfigFile, config)) {
+        std::cout << "Loaded config from: " << resolvedConfigFile << std::endl;
     }
     
     /** 使用配置文件的值作为默认值 */
     int port = config.port;
     std::string docRoot = config.docRoot;
     int numThreads = config.threadPoolSize;
+
+    // 若配置中是相对路径，则基于配置文件目录解析，避免在 build/ 启动时路径失效
+    if (!resolvedConfigFile.empty()) {
+        docRoot = resolvePathByConfigDir(docRoot, resolvedConfigFile);
+    }
     
     /** 第三步：解析其他命令行参数（命令行参数优先级最高） */
     static struct option longOptions[] = {
@@ -233,6 +312,7 @@ int main(int argc, char* argv[]) {
             case 'c':
                 /** 设置配置文件路径 */
                 configFile = optarg;
+                resolvedConfigFile = resolveConfigPath(configFile, argv[0]);
                 break;
             case 'p':
                 /** 解析端口参数 */

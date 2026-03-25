@@ -107,6 +107,9 @@ bool Logger::init(const std::string& accessLogPath,
         std::cout << logLine << std::endl;
     }
 
+    // 后台启动时需要立即可见启动日志，避免因缓冲造成"看不到启动记录"
+    m_accessLogFile.flush(); 
+
     return true;
 }
 
