@@ -49,7 +49,7 @@ struct Config {
     int debug;             /**< 调试模式 */
     int logToConsole;      /**< 日志是否输出到控制台 (1=是, 0=否) */
     
-    Config() : port(8080), threadPoolSize(4), docRoot("./html_docs"), debug(0), logToConsole(1) {}
+    Config() : port(8080), threadPoolSize(8), docRoot("./html_docs"), debug(0), logToConsole(0) {}
 };
 
 /**
@@ -60,7 +60,7 @@ struct Config {
  *   - thread_pool_size: 线程池大小
  *   - doc_root: 文档根目录
  *   - debug: 调试模式
- * 
+ *   - log_to_console: 日志是否输出到控制台
  * @param configFilePath 配置文件路径
  * @param config 输出参数，解析后的配置结果
  * @return bool 解析成功返回 true，失败返回 false

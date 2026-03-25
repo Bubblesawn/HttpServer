@@ -32,11 +32,22 @@
 #include <algorithm>         // 算法
 #include <cctype>           // 字符处理
 #include <iostream>          // 输入输出
+#include <unordered_map>     // socket读取缓冲
 
 // 为兼容旧版本系统，定义EPOLLRDHUP（如果未定义）
 #ifndef EPOLLRDHUP
 #define EPOLLRDHUP 0x2000
 #endif
+
+namespace {
+std::mutex g_readBufferMutex;
+std::unordered_map<int, std::string> g_socketReadBuffers;
+
+void clearSocketReadBuffer(int fd) {
+    std::lock_guard<std::mutex> lock(g_readBufferMutex);
+    g_socketReadBuffers.erase(fd);
+}
+} // namespace
 
 /**
  * @brief 构造函数
@@ -733,6 +744,7 @@ void HttpServer::handleClientRead(int clientSocket, uint32_t events) {
             this->m_epollManager->addFd(clientSocket, EpollEventType::READ, clientCallback, false);
         } else {
             // 非Keep-Alive或出错：关闭socket
+            clearSocketReadBuffer(clientSocket);
             close(clientSocket);
         }
     });
@@ -751,6 +763,7 @@ void HttpServer::cleanupClient(int clientSocket) {
         m_epollManager->removeFd(clientSocket);
     }
     // 关闭socket
+    clearSocketReadBuffer(clientSocket);
     close(clientSocket);
     // 移除客户端信息
     {
@@ -1257,42 +1270,86 @@ bool HttpServer::isPathTraversal(const std::string& path) const {
  */
 int HttpServer::readLine(int socket, std::string& line) const {
     line.clear();
-    char ch;
-    ssize_t n;
 
-    // 按字节读取
+    // 先消费已有缓冲，再按块读取并持续尝试切行
     while (true) {
-        n = read(socket, &ch, 1);
-        if (n < 0) {
-            // 非阻塞模式下，EAGAIN表示数据已读完
-            if (errno == EAGAIN || errno == EWOULDBLOCK) {
-                // 如果已经读到了一些数据，返回成功
-                // 否则返回-1表示需要等待更多数据
-                return line.empty() ? -1 : line.length();
+        {
+            std::lock_guard<std::mutex> lock(g_readBufferMutex);
+            auto it = g_socketReadBuffers.find(socket);
+            if (it != g_socketReadBuffers.end()) {
+                std::string& buffer = it->second;
+                size_t newlinePos = buffer.find('\n');
+                if (newlinePos != std::string::npos) {
+                    line.assign(buffer.data(), newlinePos);
+                    if (!line.empty() && line.back() == '\r') {
+                        line.pop_back();
+                    }
+
+                    buffer.erase(0, newlinePos + 1);
+                    if (buffer.empty()) {
+                        g_socketReadBuffers.erase(it);
+                    }
+                    return static_cast<int>(line.length());
+                }
             }
-            // 其他错误
-            if (line.empty()) {
+        }
+
+        char chunk[4096];
+        ssize_t n = read(socket, chunk, sizeof(chunk));
+        if (n < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+
+            // 超时/无更多数据时，若已有残留缓冲则按旧语义返回部分行
+            if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                std::lock_guard<std::mutex> lock(g_readBufferMutex);
+                auto it = g_socketReadBuffers.find(socket);
+                if (it != g_socketReadBuffers.end() && !it->second.empty()) {
+                    line = it->second;
+                    if (!line.empty() && line.back() == '\r') {
+                        line.pop_back();
+                    }
+                    g_socketReadBuffers.erase(it);
+                    return static_cast<int>(line.length());
+                }
                 return -1;
             }
-            return line.length();
+
+            // 其他错误：有残留则返回部分行，否则失败
+            std::lock_guard<std::mutex> lock(g_readBufferMutex);
+            auto it = g_socketReadBuffers.find(socket);
+            if (it != g_socketReadBuffers.end() && !it->second.empty()) {
+                line = it->second;
+                if (!line.empty() && line.back() == '\r') {
+                    line.pop_back();
+                }
+                g_socketReadBuffers.erase(it);
+                return static_cast<int>(line.length());
+            }
+            return -1;
         }
+
         if (n == 0) {
-            // 连接关闭
-            return line.empty() ? -1 : line.length();
+            // 连接关闭：把残留缓冲作为最后一行返回
+            std::lock_guard<std::mutex> lock(g_readBufferMutex);
+            auto it = g_socketReadBuffers.find(socket);
+            if (it != g_socketReadBuffers.end() && !it->second.empty()) {
+                line = it->second;
+                if (!line.empty() && line.back() == '\r') {
+                    line.pop_back();
+                }
+                g_socketReadBuffers.erase(it);
+                return static_cast<int>(line.length());
+            }
+            return -1;
         }
 
-        if (ch == '\n') {
-            // 换行符，行的结束
-            break;
-        }
-
-        // 跳过\r（处理\r\n和\r的情况）
-        if (ch != '\r') {
-            line += ch;
+        {
+            std::lock_guard<std::mutex> lock(g_readBufferMutex);
+            g_socketReadBuffers[socket].append(chunk, static_cast<size_t>(n));
         }
     }
-
-    return line.length();
 }
 
 /**
