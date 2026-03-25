@@ -42,6 +42,7 @@ public:
         STATUS_200_OK = 200,                     /**< 请求成功 */
         STATUS_201_CREATED = 201,                /**< 资源创建成功 */
         STATUS_204_NO_CONTENT = 204,             /**< 请求成功，无返回内容 */
+        STATUS_206_PARTIAL_CONTENT = 206,        /**< 部分内容（Range 请求） */
 
         // 3xx - 重定向
         STATUS_301_MOVED_PERMANENTLY = 301,      /**< 资源永久移动 */
@@ -57,6 +58,7 @@ public:
         STATUS_408_REQUEST_TIMEOUT = 408,        /**< 请求超时 */
         STATUS_413_PAYLOAD_TOO_LARGE = 413,      /**< 请求体过大 */
         STATUS_414_URI_TOO_LONG = 414,           /**< 请求URI过长 */
+        STATUS_416_RANGE_NOT_SATISFIABLE = 416,  /**< 请求范围无效 */
 
         // 5xx - 服务器错误
         STATUS_500_INTERNAL_SERVER_ERROR = 500, /**< 服务器内部错误 */

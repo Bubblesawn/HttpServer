@@ -314,6 +314,7 @@ std::string HttpResponse::statusCodeToString(StatusCode code) {
         case STATUS_200_OK: return "OK";
         case STATUS_201_CREATED: return "Created";
         case STATUS_204_NO_CONTENT: return "No Content";
+        case STATUS_206_PARTIAL_CONTENT: return "Partial Content";
         case STATUS_301_MOVED_PERMANENTLY: return "Moved Permanently";
         case STATUS_302_FOUND: return "Found";
         case STATUS_304_NOT_MODIFIED: return "Not Modified";
@@ -325,6 +326,7 @@ std::string HttpResponse::statusCodeToString(StatusCode code) {
         case STATUS_408_REQUEST_TIMEOUT: return "Request Timeout";
         case STATUS_413_PAYLOAD_TOO_LARGE: return "Payload Too Large";
         case STATUS_414_URI_TOO_LONG: return "URI Too Long";
+        case STATUS_416_RANGE_NOT_SATISFIABLE: return "Range Not Satisfiable";
         case STATUS_500_INTERNAL_SERVER_ERROR: return "Internal Server Error";
         case STATUS_501_NOT_IMPLEMENTED: return "Not Implemented";
         case STATUS_502_BAD_GATEWAY: return "Bad Gateway";

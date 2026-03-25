@@ -31,6 +31,7 @@
 #include <sstream>           // 字符串流
 #include <algorithm>         // 算法
 #include <cctype>           // 字符处理
+#include <limits>           // 数值边界
 #include <iostream>          // 输入输出
 #include <unordered_map>     // socket读取缓冲
 
@@ -42,6 +43,109 @@
 namespace {
 std::mutex g_readBufferMutex;
 std::unordered_map<int, std::string> g_socketReadBuffers;
+
+enum class RangeParseResult {
+    NOT_PRESENT,
+    VALID,
+    INVALID
+};
+
+std::string trimWhitespace(const std::string& input) {
+    const size_t start = input.find_first_not_of(" \t");
+    if (start == std::string::npos) {
+        return "";
+    }
+    const size_t end = input.find_last_not_of(" \t");
+    return input.substr(start, end - start + 1);
+}
+
+RangeParseResult parseSingleRangeHeader(const std::string& rangeHeader,
+                                        off_t fileSize,
+                                        off_t& rangeStart,
+                                        off_t& rangeEnd) {
+    if (rangeHeader.empty()) {
+        return RangeParseResult::NOT_PRESENT;
+    }
+
+    std::string normalized = trimWhitespace(rangeHeader);
+    if (normalized.size() < 6) {
+        return RangeParseResult::INVALID;
+    }
+
+    std::string prefix = normalized.substr(0, 6);
+    std::transform(prefix.begin(), prefix.end(), prefix.begin(), [](unsigned char ch) {
+        return static_cast<char>(std::tolower(ch));
+    });
+    if (prefix != "bytes=") {
+        return RangeParseResult::INVALID;
+    }
+
+    std::string spec = trimWhitespace(normalized.substr(6));
+    if (spec.empty() || spec.find(',') != std::string::npos) {
+        return RangeParseResult::INVALID;
+    }
+
+    const size_t dashPos = spec.find('-');
+    if (dashPos == std::string::npos) {
+        return RangeParseResult::INVALID;
+    }
+
+    std::string startPart = trimWhitespace(spec.substr(0, dashPos));
+    std::string endPart = trimWhitespace(spec.substr(dashPos + 1));
+
+    if (startPart.empty() && endPart.empty()) {
+        return RangeParseResult::INVALID;
+    }
+
+    try {
+        if (startPart.empty()) {
+            long long suffixLen = std::stoll(endPart);
+            if (suffixLen <= 0 || fileSize <= 0) {
+                return RangeParseResult::INVALID;
+            }
+
+            if (suffixLen >= fileSize) {
+                rangeStart = 0;
+            } else {
+                rangeStart = fileSize - suffixLen;
+            }
+            rangeEnd = fileSize - 1;
+            return RangeParseResult::VALID;
+        }
+
+        long long parsedStart = std::stoll(startPart);
+        if (parsedStart < 0 || fileSize <= 0) {
+            return RangeParseResult::INVALID;
+        }
+
+        rangeStart = static_cast<off_t>(parsedStart);
+        if (rangeStart >= fileSize) {
+            return RangeParseResult::INVALID;
+        }
+
+        if (endPart.empty()) {
+            rangeEnd = fileSize - 1;
+            return RangeParseResult::VALID;
+        }
+
+        long long parsedEnd = std::stoll(endPart);
+        if (parsedEnd < 0) {
+            return RangeParseResult::INVALID;
+        }
+
+        rangeEnd = static_cast<off_t>(parsedEnd);
+        if (rangeEnd < rangeStart) {
+            return RangeParseResult::INVALID;
+        }
+        if (rangeEnd >= fileSize) {
+            rangeEnd = fileSize - 1;
+        }
+
+        return RangeParseResult::VALID;
+    } catch (...) {
+        return RangeParseResult::INVALID;
+    }
+}
 
 void clearSocketReadBuffer(int fd) {
     std::lock_guard<std::mutex> lock(g_readBufferMutex);
@@ -881,16 +985,73 @@ bool HttpServer::handleClient(int clientSocket, const std::string& clientIp, int
     int fileFd = -1;           // 文件描述符（用于sendfile）
     off_t fileOffset = 0;      // 文件偏移量
     size_t fileSize = 0;       // 文件大小
+    size_t fullFileSize = 0;   // 文件总大小（用于Range与缓存逻辑）
 
-    if (!response.getFilePath().empty() && response.getStatusCode() == HttpResponse::STATUS_200_OK) {
+    // 对静态文件响应支持单段Range请求
+    if (parseSuccess && !response.getFilePath().empty() &&
+        response.getStatusCode() == HttpResponse::STATUS_200_OK) {
+        response.addHeader("Accept-Ranges", "bytes");
+
+        const std::string rangeHeader = request.getHeader("Range");
+        if (!rangeHeader.empty()) {
+            struct stat st;
+            if (stat(response.getFilePath().c_str(), &st) == 0 && S_ISREG(st.st_mode)) {
+                off_t rangeStart = 0;
+                off_t rangeEnd = 0;
+                RangeParseResult parseResult = parseSingleRangeHeader(rangeHeader, st.st_size, rangeStart, rangeEnd);
+
+                if (parseResult == RangeParseResult::VALID) {
+                    response.setStatusCode(HttpResponse::STATUS_206_PARTIAL_CONTENT);
+                    response.addHeader("Content-Range",
+                                       "bytes " + std::to_string(rangeStart) + "-" +
+                                       std::to_string(rangeEnd) + "/" +
+                                       std::to_string(static_cast<long long>(st.st_size)));
+                } else if (parseResult == RangeParseResult::INVALID) {
+                    response.setStatusCode(HttpResponse::STATUS_416_RANGE_NOT_SATISFIABLE);
+                    response.addHeader("Content-Range",
+                                       "bytes */" + std::to_string(static_cast<long long>(st.st_size)));
+                    response.setBody("");
+                    response.setFilePath("");
+                }
+            }
+        }
+    }
+
+    if (!response.getFilePath().empty() &&
+        (response.getStatusCode() == HttpResponse::STATUS_200_OK ||
+         response.getStatusCode() == HttpResponse::STATUS_206_PARTIAL_CONTENT)) {
+        off_t rangeStart = 0;
+        off_t rangeEnd = 0;
+        bool isPartialContent = false;
+
+        if (response.getStatusCode() == HttpResponse::STATUS_206_PARTIAL_CONTENT) {
+            const std::string rangeHeader = request.getHeader("Range");
+            struct stat st;
+            if (stat(response.getFilePath().c_str(), &st) == 0) {
+                isPartialContent =
+                    (parseSingleRangeHeader(rangeHeader, st.st_size, rangeStart, rangeEnd) == RangeParseResult::VALID);
+            }
+        }
+
         // 优先尝试从缓存获取文件内容
         if (m_fileCache && m_fileCache->isEnabled()) {
             auto cachedContent = m_fileCache->get(response.getFilePath());
             if (cachedContent) {
                 // 缓存命中，使用缓存内容
-                bodyToSend = *cachedContent;
-                responseSize = cachedContent->size();
-                useCache = true;
+                if (isPartialContent) {
+                    size_t start = static_cast<size_t>(rangeStart);
+                    size_t end = static_cast<size_t>(rangeEnd);
+                    if (start < cachedContent->size() && end >= start) {
+                        size_t len = end - start + 1;
+                        bodyToSend = cachedContent->substr(start, len);
+                        responseSize = bodyToSend.size();
+                        useCache = true;
+                    }
+                } else {
+                    bodyToSend = *cachedContent;
+                    responseSize = cachedContent->size();
+                    useCache = true;
+                }
             }
         }
 
@@ -901,12 +1062,20 @@ bool HttpServer::handleClient(int clientSocket, const std::string& clientIp, int
             if (fileFd >= 0) {
                 struct stat fileStat;
                 if (fstat(fileFd, &fileStat) == 0) {
-                    fileSize = fileStat.st_size;
-                    responseSize = fileSize;
+                    fullFileSize = fileStat.st_size;
+                    if (isPartialContent) {
+                        fileOffset = rangeStart;
+                        responseSize = static_cast<size_t>(rangeEnd - rangeStart + 1);
+                        fileSize = responseSize;
+                    } else {
+                        responseSize = fullFileSize;
+                        fileSize = fullFileSize;
+                    }
                     useSendfile = true;
 
                     // 如果文件较小，仍然使用缓存
-                    if (m_fileCache && m_fileCache->isEnabled() && fileSize <= m_fileCache->getMaxFileSize()) {
+                    if (m_fileCache && m_fileCache->isEnabled() &&
+                        fullFileSize <= m_fileCache->getMaxFileSize()) {
                         char buffer[8192];
                         ssize_t bytesRead;
                         std::string fileContent;
@@ -931,7 +1100,9 @@ bool HttpServer::handleClient(int clientSocket, const std::string& clientIp, int
         keepAlive = false;  // 发送失败，关闭连接
     }
 
-    if (useSendfile && fileFd >= 0) {
+    const bool shouldSendBody = !(parseSuccess && request.getMethod() == HttpRequest::METHOD_HEAD);
+
+    if (shouldSendBody && useSendfile && fileFd >= 0) {
         // 使用sendfile零拷贝发送文件内容，性能更优
         ssize_t sent;
         while (fileSize > 0) {
@@ -946,7 +1117,9 @@ bool HttpServer::handleClient(int clientSocket, const std::string& clientIp, int
             fileSize -= sent;
         }
         close(fileFd);
-    } else if (!bodyToSend.empty()) {
+    } else if (fileFd >= 0) {
+        close(fileFd);
+    } else if (shouldSendBody && !bodyToSend.empty()) {
         // 使用缓存内容或普通响应体发送
         if (sendData(clientSocket, bodyToSend.c_str(), bodyToSend.size()) <= 0) {
             keepAlive = false;  // 发送失败，关闭连接
