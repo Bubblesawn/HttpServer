@@ -235,8 +235,11 @@ std::string HttpResponse::toString() const {
     // 3. Server头部
     result += "Server: CppHttpServer/1.0\r\n";
 
-    // 4. 其他自定义头部
+    // 4. 其他自定义头部（Connection 统一在后面输出，避免重复）
     for (const auto& header : m_headers) {
+        if (header.first == "Connection") {
+            continue;
+        }
         result += header.first + ": " + header.second + "\r\n";
     }
 
@@ -247,8 +250,12 @@ std::string HttpResponse::toString() const {
         result += "Content-Length: " + std::to_string(bodySize) + "\r\n";
     }
 
-    // 6. Connection头部
-    result += "Connection: Close\r\n";
+    // 6. Connection头部：优先使用已设置值，否则默认Close
+    std::string connectionValue = getHeader("Connection");
+    if (connectionValue.empty()) {
+        connectionValue = "Close";
+    }
+    result += "Connection: " + connectionValue + "\r\n";
 
     // 7. 空行，标志头部结束
     result += "\r\n";
@@ -282,8 +289,11 @@ std::string HttpResponse::buildHeaderString(size_t contentLength) const {
     // 3. Server头部
     result += "Server: CppHttpServer/1.0\r\n";
 
-    // 4. 其他自定义头部
+    // 4. 其他自定义头部（Connection 统一在后面输出，避免重复）
     for (const auto& header : m_headers) {
+        if (header.first == "Connection") {
+            continue;
+        }
         result += header.first + ": " + header.second + "\r\n";
     }
 
@@ -292,8 +302,12 @@ std::string HttpResponse::buildHeaderString(size_t contentLength) const {
         result += "Content-Length: " + std::to_string(contentLength) + "\r\n";
     }
 
-    // 6. Connection头部
-    result += "Connection: Close\r\n";
+    // 6. Connection头部：优先使用已设置值，否则默认Close
+    std::string connectionValue = getHeader("Connection");
+    if (connectionValue.empty()) {
+        connectionValue = "Close";
+    }
+    result += "Connection: " + connectionValue + "\r\n";
 
     // 7. 空行
     result += "\r\n";
