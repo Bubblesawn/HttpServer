@@ -1,0 +1,8 @@
+.git
+.gitignore
+build
+logs
+*.pid
+*.log
+http_server_cpp
+*.swp

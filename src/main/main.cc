@@ -383,7 +383,9 @@ int main(int argc, char* argv[]) {
     // 初始化日志系统
     // 根据配置文件中的 log_to_console 设置决定是否输出到控制台
     bool consoleOutput = (config.logToConsole != 0);
-    if (!Logger::getInstance().init("./logs/access.log", "./logs/error.log", LogLevel::INFO, consoleOutput)) {
+    std::string accessLogPath = resolvePathByConfigDir("./logs/access.log", resolvedConfigFile);
+    std::string errorLogPath = resolvePathByConfigDir("./logs/error.log", resolvedConfigFile);
+    if (!Logger::getInstance().init(accessLogPath, errorLogPath, LogLevel::INFO, consoleOutput)) {
         std::cerr << "Failed to initialize logger" << std::endl;
         return 1;
     }
