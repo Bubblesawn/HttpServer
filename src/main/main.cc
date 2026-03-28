@@ -188,6 +188,31 @@ std::string resolvePathByConfigDir(const std::string& pathValue, const std::stri
 }
 
 /**
+ * @brief 解析项目根目录
+ *
+ * 从可执行文件所在位置向上查找 CMakeLists.txt，确保无论从 build/ 还是项目根目录启动，
+ * 都能定位到仓库根目录。
+ */
+fs::path resolveProjectRoot(const char* argv0) {
+    fs::path exePath = fs::absolute(fs::path(argv0 ? argv0 : ""));
+    fs::path currentDir = exePath.has_parent_path() ? exePath.parent_path() : fs::current_path();
+
+    while (!currentDir.empty()) {
+        if (fs::exists(currentDir / "CMakeLists.txt")) {
+            return currentDir;
+        }
+
+        fs::path parentDir = currentDir.parent_path();
+        if (parentDir == currentDir) {
+            break;
+        }
+        currentDir = parentDir;
+    }
+
+    return fs::current_path();
+}
+
+/**
  * @brief 打印程序使用说明
  * 
  * 显示所有可用的命令行选项及其说明。
@@ -383,8 +408,12 @@ int main(int argc, char* argv[]) {
     // 初始化日志系统
     // 根据配置文件中的 log_to_console 设置决定是否输出到控制台
     bool consoleOutput = (config.logToConsole != 0);
-    std::string accessLogPath = resolvePathByConfigDir("./logs/access.log", resolvedConfigFile);
-    std::string errorLogPath = resolvePathByConfigDir("./logs/error.log", resolvedConfigFile);
+    fs::path projectRoot = resolveProjectRoot(argv[0]);
+    fs::path logDir = projectRoot / "logs";
+    fs::create_directories(logDir);
+
+    std::string accessLogPath = (logDir / "access.log").string();
+    std::string errorLogPath = (logDir / "error.log").string();
     if (!Logger::getInstance().init(accessLogPath, errorLogPath, LogLevel::INFO, consoleOutput)) {
         std::cerr << "Failed to initialize logger" << std::endl;
         return 1;
