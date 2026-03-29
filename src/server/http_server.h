@@ -25,6 +25,9 @@ class HttpResponse;
 class TcpServer;
 class FileCache;     // 文件缓存前向声明
 
+// 请求方法类型需要完整定义
+#include "../request/http_request.h"
+
 // 包含日志系统头文件
 #include "../logger/logger.h"
 
@@ -252,6 +255,8 @@ public:
     std::string getLocalIp() const;
 
 private:
+    using RouteTable = std::unordered_map<std::string, RequestHandler>;
+
     /**
      * @brief 处理客户端可读事件（epoll模式）
      *
@@ -282,6 +287,26 @@ private:
      * @param clientSocket 客户端socket描述符
      */
     void cleanupClient(int clientSocket);
+
+    /**
+     * @brief 注册默认路由
+     */
+    void registerDefaultRoutes();
+
+    /**
+     * @brief 注册单个路由
+     */
+    void registerRoute(HttpRequest::Method method, const std::string& path, RequestHandler handler);
+
+    /**
+     * @brief 构造路由键
+     */
+    std::string buildRouteKey(HttpRequest::Method method, const std::string& path) const;
+
+    /**
+     * @brief 分发到显式路由
+     */
+    bool dispatchRoute(const HttpRequest& request, HttpResponse& response) const;
 
     /**
      * @brief 处理客户端请求
@@ -346,6 +371,16 @@ private:
      * @return HttpResponse JSON响应对象
      */
     HttpResponse handleApiEcho(const HttpRequest& request) const;
+
+    /**
+     * @brief 处理健康检查路由
+     */
+    HttpResponse handleHealthCheck() const;
+
+    /**
+     * @brief 处理状态路由
+     */
+    HttpResponse handleStatusRequest() const;
 
     /**
      * @brief URL解码
@@ -438,6 +473,9 @@ private:
 
     /** 自定义请求处理函数 */
     RequestHandler m_requestHandler;
+
+    /** 显式路由表 */
+    RouteTable m_routeHandlers;
 
     //================== epoll相关成员变量 ==================
 

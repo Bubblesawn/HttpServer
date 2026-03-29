@@ -152,6 +152,13 @@ void clearSocketReadBuffer(int fd) {
     std::lock_guard<std::mutex> lock(g_readBufferMutex);
     g_socketReadBuffers.erase(fd);
 }
+
+void stripResponseBodyForHead(HttpResponse& response) {
+    const std::string contentType = response.getContentType();
+    response.setBody("");
+    response.setFilePath("");
+    response.setContentType(contentType);
+}
 } // namespace
 
 /**
@@ -180,6 +187,8 @@ HttpServer::HttpServer(const std::string& ip, int port)
      * 常见场景：客户端提前关闭连接，但服务器仍在发送数据
      */
     signal(SIGPIPE, SIG_IGN);
+
+    registerDefaultRoutes();
 }
 
 /**
@@ -452,6 +461,53 @@ void HttpServer::clearCache() {
     }
 }
 
+std::string HttpServer::buildRouteKey(HttpRequest::Method method, const std::string& path) const {
+    return HttpRequest::methodToString(method) + " " + path;
+}
+
+void HttpServer::registerRoute(HttpRequest::Method method, const std::string& path, RequestHandler handler) {
+    m_routeHandlers[buildRouteKey(method, path)] = std::move(handler);
+}
+
+void HttpServer::registerDefaultRoutes() {
+    m_routeHandlers.clear();
+
+    registerRoute(HttpRequest::METHOD_GET, "/api/echo", [this](const HttpRequest& request) {
+        return handleApiEcho(request);
+    });
+    registerRoute(HttpRequest::METHOD_HEAD, "/api/echo", [this](const HttpRequest& request) {
+        return handleApiEcho(request);
+    });
+    registerRoute(HttpRequest::METHOD_POST, "/api/echo", [this](const HttpRequest& request) {
+        return handleApiEcho(request);
+    });
+
+    registerRoute(HttpRequest::METHOD_GET, "/health", [this](const HttpRequest&) {
+        return handleHealthCheck();
+    });
+    registerRoute(HttpRequest::METHOD_HEAD, "/health", [this](const HttpRequest&) {
+        return handleHealthCheck();
+    });
+
+    registerRoute(HttpRequest::METHOD_GET, "/status", [this](const HttpRequest&) {
+        return handleStatusRequest();
+    });
+    registerRoute(HttpRequest::METHOD_HEAD, "/status", [this](const HttpRequest&) {
+        return handleStatusRequest();
+    });
+}
+
+bool HttpServer::dispatchRoute(const HttpRequest& request, HttpResponse& response) const {
+    const std::string routeKey = buildRouteKey(request.getMethod(), request.getPath());
+    const auto it = m_routeHandlers.find(routeKey);
+    if (it == m_routeHandlers.end()) {
+        return false;
+    }
+
+    response = it->second(request);
+    return true;
+}
+
 /**
  * @brief 设置自定义请求处理函数
  * 
@@ -689,9 +745,12 @@ bool HttpServer::handleClient(int clientSocket, const std::string& clientIp, int
         request = parseRequest(clientSocket);
 
         // 检查请求是否有效（如果解析失败，request会是默认构造的无效对象）
-        if (request.getMethod() == HttpRequest::METHOD_UNKNOWN || request.getUrl().empty()) {
+        if (request.getUrl().empty()) {
             response = HttpResponse::badRequest();
             LOG_WARN("Invalid request from " + clientIp + ":" + std::to_string(clientPort));
+        } else if (request.getMethod() == HttpRequest::METHOD_UNKNOWN) {
+            response = HttpResponse::notImplemented();
+            LOG_WARN("Unsupported HTTP method from " + clientIp + ":" + std::to_string(clientPort));
         } else {
             parseSuccess = true;
             // 步骤2：根据请求类型调用相应处理函数
@@ -699,35 +758,23 @@ bool HttpServer::handleClient(int clientSocket, const std::string& clientIp, int
                 // 使用自定义处理函数
                 response = m_requestHandler(request);
             } else {
-                // 默认处理
-                if (request.getMethod() == HttpRequest::METHOD_GET) {
-                    // 处理API端点
-                    if (request.getPath() == "/api/echo") {
-                        response = handleApiEcho(request);
-                    } else {
-                        // GET请求提供静态文件服务
+                if (!dispatchRoute(request, response)) {
+                    if (request.getMethod() == HttpRequest::METHOD_GET ||
+                        request.getMethod() == HttpRequest::METHOD_HEAD) {
                         response = handleStaticFile(request);
-                    }
-                } else if (request.getMethod() == HttpRequest::METHOD_HEAD) {
-                    // HEAD请求处理：与GET相同，但不返回响应体
-                    if (request.getPath() == "/api/echo") {
-                        response = handleApiEcho(request);
+                    } else if (request.getMethod() == HttpRequest::METHOD_POST) {
+                        response = handlePostRequest(request);
+                    } else if (request.getMethod() == HttpRequest::METHOD_PUT ||
+                               request.getMethod() == HttpRequest::METHOD_DELETE) {
+                        response = HttpResponse::methodNotAllowed();
                     } else {
-                        response = handleStaticFile(request);
+                        response = HttpResponse::notImplemented();
                     }
-                    // HEAD请求不返回响应体，清空body和文件路径
-                    // 注意：保留Content-Type，因为HEAD响应应该包含与GET相同的头部信息
-                    std::string contentType = response.getContentType();
-                    response.setBody("");
-                    response.setFilePath("");
-                    response.setContentType(contentType);
-                } else if (request.getMethod() == HttpRequest::METHOD_POST) {
-                    // POST请求处理
-                    response = handlePostRequest(request);
-                } else {
-                    // 其他HTTP方法返回501 Not Implemented
-                    response = HttpResponse::notImplemented();
                 }
+            }
+
+            if (request.getMethod() == HttpRequest::METHOD_HEAD) {
+                stripResponseBodyForHead(response);
             }
         }
     } catch (const std::exception& e) {
@@ -1395,32 +1442,6 @@ HttpResponse HttpServer::handlePostRequest(const HttpRequest& request) const {
 
     std::string path = request.getPath();
     
-    // 处理 /api/echo 端点 - 用于测试POST请求
-    if (path == "/api/echo") {
-        // 构建JSON响应
-        std::ostringstream json;
-        json << "{\n";
-        json << "  \"method\": \"POST\",\n";
-        json << "  \"path\": \"" << path << "\",\n";
-        json << "  \"contentType\": \"" << request.getContentType() << "\",\n";
-        json << "  \"body\": \"" << request.getBody() << "\",\n";
-        
-        // 解析并输出表单数据
-        auto formData = request.parseFormData();
-        json << "  \"formData\": {\n";
-        bool first = true;
-        for (const auto& pair : formData) {
-            if (!first) json << ",\n";
-            json << "    \"" << pair.first << "\": \"" << pair.second << "\"";
-            first = false;
-        }
-        json << "\n  }\n";
-        json << "}";
-        
-        response.setBody(json.str());
-        return response;
-    }
-    
     // 其他POST请求返回简单的确认信息
     std::ostringstream json;
     json << "{\n";
@@ -1487,6 +1508,42 @@ HttpResponse HttpServer::handleApiEcho(const HttpRequest& request) const {
     }
 
     json << "\n}";
+
+    response.setBody(json.str());
+    return response;
+}
+
+HttpResponse HttpServer::handleHealthCheck() const {
+    HttpResponse response;
+    response.setStatusCode(HttpResponse::STATUS_200_OK);
+    response.addHeader("Content-Type", "application/json; charset=utf-8");
+
+    std::ostringstream json;
+    json << "{\n";
+    json << "  \"status\": \"ok\",\n";
+    json << "  \"service\": \"CppHttpServer\",\n";
+    json << "  \"routeCount\": " << m_routeHandlers.size() << "\n";
+    json << "}";
+
+    response.setBody(json.str());
+    return response;
+}
+
+HttpResponse HttpServer::handleStatusRequest() const {
+    HttpResponse response;
+    response.setStatusCode(HttpResponse::STATUS_200_OK);
+    response.addHeader("Content-Type", "application/json; charset=utf-8");
+
+    std::ostringstream json;
+    json << "{\n";
+    json << "  \"running\": " << (m_running.load() ? "true" : "false") << ",\n";
+    json << "  \"ip\": \"" << m_ip << "\",\n";
+    json << "  \"port\": " << m_port << ",\n";
+    json << "  \"docRoot\": \"" << m_docRoot << "\",\n";
+    json << "  \"threads\": " << m_numThreads << ",\n";
+    json << "  \"cacheEnabled\": " << (isCacheEnabled() ? "true" : "false") << ",\n";
+    json << "  \"cacheStats\": " << getCacheStats() << "\n";
+    json << "}";
 
     response.setBody(json.str());
     return response;

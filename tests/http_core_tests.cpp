@@ -121,6 +121,20 @@ void testHttpResponseFileBodySize() {
     std::filesystem::remove(tempFile);
 }
 
+void testHttpResponseErrorFactories() {
+    const HttpResponse methodNotAllowed = HttpResponse::methodNotAllowed();
+    const HttpResponse notImplemented = HttpResponse::notImplemented();
+
+    expectTrue(methodNotAllowed.getStatusCode() == HttpResponse::STATUS_405_METHOD_NOT_ALLOWED,
+               "methodNotAllowed should set 405 status");
+    expectTrue(notImplemented.getStatusCode() == HttpResponse::STATUS_501_NOT_IMPLEMENTED,
+               "notImplemented should set 501 status");
+    expectTrue(methodNotAllowed.buildHeaderString(methodNotAllowed.getBodySize()).find("Connection: Close\r\n") != std::string::npos,
+               "405 response should serialize default close connection");
+    expectTrue(notImplemented.buildHeaderString(notImplemented.getBodySize()).find("Connection: Close\r\n") != std::string::npos,
+               "501 response should serialize default close connection");
+}
+
 }  // namespace
 
 int main() {
@@ -128,6 +142,7 @@ int main() {
     testHttpRequestClear();
     testHttpResponseSerialization();
     testHttpResponseFileBodySize();
+    testHttpResponseErrorFactories();
 
     if (g_failed != 0) {
         std::cerr << "[RESULT] " << g_failed << "/" << g_run << " checks failed" << std::endl;
