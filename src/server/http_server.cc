@@ -11,6 +11,7 @@
 #include "../response/http_response.h"
 #include "../thread/thread_pool.h"
 #include "../cache/file_cache.h"
+#include "../server/tcp_server.h"
 #include <thread>
 
 // POSIX网络编程头文件
@@ -166,8 +167,8 @@ HttpServer::HttpServer(const std::string& ip, int port)
     , m_port(port)
     , m_docRoot("./html_docs")    // 默认文档根目录
     , m_numThreads(std::thread::hardware_concurrency() * 2)  // 默认线程数为CPU核心数的2倍，提高并发处理能力
-    , m_serverSocket(-1)         // 初始化为无效socket
     , m_running(false)            // 初始状态为未运行
+    , m_tcpServer(nullptr)
     , m_useEpoll(true)           // 默认启用epoll模式
     , m_fileCache(nullptr) {     // 文件缓存初始化为nullptr
     /**
@@ -209,124 +210,32 @@ bool HttpServer::start() {
         return false;
     }
 
-    // 创建TCP socket
-    // AF_INET: IPv4协议
-    // SOCK_STREAM: 面向连接的可靠数据传输（TCP）
-    m_serverSocket = socket(AF_INET, SOCK_STREAM, 0);
-    if (m_serverSocket < 0) {
-        perror("socket");  // 输出错误信息到stderr
+    m_threadPool = std::make_unique<ThreadPool>(m_numThreads);
+    m_fileCache = std::make_unique<FileCache>();
+    m_tcpServer = std::make_unique<TcpServer>(m_ip, m_port, m_useEpoll);
+
+    m_tcpServer->setAcceptCallback([this](int clientSocket, const std::string& clientIp, int clientPort) {
+        this->handleClientAccepted(clientSocket, clientIp, clientPort);
+    });
+
+    if (!m_tcpServer->start()) {
+        LOG_ERROR("Failed to start TCP server");
+        if (m_threadPool) {
+            m_threadPool->shutdown();
+            m_threadPool.reset();
+        }
+        m_fileCache.reset();
+        m_tcpServer.reset();
+        m_running.store(false);
         return false;
     }
 
-    /**
-     * @brief 设置socket选项 - 地址重用
-     * 
-     * SO_REUSEADDR允许在服务器关闭后立即重新绑定到相同端口，
-     * 而不需要等待操作系统释放端口（通常有TIME_WAIT状态）。
-     * 
-     * 这在开发调试时特别有用，可以快速重启服务器。
-     */
-    int opt = 1;
-    if (setsockopt(m_serverSocket, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt)) < 0) {
-        perror("setsockopt(SO_REUSEADDR)");
-    }
-
-    // 准备服务器地址结构
-    struct sockaddr_in serverAddr;
-    memset(&serverAddr, 0, sizeof(serverAddr));  // 清零结构体
-    
-    serverAddr.sin_family = AF_INET;                    // IPv4
-    serverAddr.sin_port = htons(m_port);               // 端口号（主机字节序转网络字节序）
-    serverAddr.sin_addr.s_addr = inet_addr(m_ip.c_str());  // IP地址
-
-    // 绑定地址和端口到socket
-    if (bind(m_serverSocket, (struct sockaddr*)&serverAddr, sizeof(serverAddr)) < 0) {
-        perror("bind");
-        close(m_serverSocket);      // 绑定失败，关闭socket
-        m_serverSocket = -1;
-        return false;
-    }
-
-    // 开始监听连接请求
-    // SOMAXCONN: 使用系统允许的最大等待队列长度，支持高并发连接
-    if (listen(m_serverSocket, SOMAXCONN) < 0) {
-        perror("listen");
-        close(m_serverSocket);
-        m_serverSocket = -1;
-        return false;
-    }
-
-    // 设置服务器为运行状态
     m_running.store(true);
 
-    // 根据模式选择启动方式
-    if (m_useEpoll) {
-        // ========== epoll模式 ==========
-        // 创建线程池（用于处理请求）
-        m_threadPool = std::make_unique<ThreadPool>(m_numThreads);
-
-        // 创建文件缓存
-        m_fileCache = std::make_unique<FileCache>();
-
-        // 创建epoll管理器
-        m_epollManager = std::make_unique<EpollManager>();
-        if (!m_epollManager->create()) {
-            LOG_ERROR("Failed to create epoll instance");
-            close(m_serverSocket);
-            m_serverSocket = -1;
-            m_running.store(false);
-            return false;
-        }
-
-        // 设置服务器socket为非阻塞模式
-        if (!EpollManager::setNonBlocking(m_serverSocket)) {
-            LOG_ERROR("Failed to set server socket to non-blocking mode");
-            m_epollManager->closeEpoll();
-            close(m_serverSocket);
-            m_serverSocket = -1;
-            m_running.store(false);
-            return false;
-        }
-
-        // 添加服务器socket到epoll监听（水平触发模式，避免遗漏连接）
-        auto serverCallback = [this](int fd, uint32_t events) {
-            this->handleServerRead(fd, events);
-        };
-        if (!m_epollManager->addFd(m_serverSocket, EpollEventType::READ, serverCallback, false)) {
-            LOG_ERROR("Failed to add server socket to epoll");
-            m_epollManager->closeEpoll();
-            close(m_serverSocket);
-            m_serverSocket = -1;
-            m_running.store(false);
-            return false;
-        }
-
-        // 启动epoll事件处理线程
-        m_epollThread = std::thread(&HttpServer::epollEventLoop, this);
-
-        LOG_INFO("Server started on " + m_ip + ":" + std::to_string(m_port));
-        LOG_INFO("Document root: " + m_docRoot);
-        LOG_INFO("Thread pool size: " + std::to_string(m_numThreads));
-        LOG_INFO("Mode: epoll + thread pool (hybrid)");
-    } else {
-        // ========== 传统线程池模式 ==========
-        // 创建线程池
-        m_threadPool = std::make_unique<ThreadPool>(m_numThreads);
-
-        // 创建文件缓存
-        m_fileCache = std::make_unique<FileCache>();
-
-        // 启动接受连接的线程
-        m_acceptThread = std::thread(&HttpServer::acceptConnections, this);
-
-        LOG_INFO("Server started on " + m_ip + ":" + std::to_string(m_port));
-        LOG_INFO("Document root: " + m_docRoot);
-        LOG_INFO("Thread pool size: " + std::to_string(m_numThreads));
-        LOG_INFO("Mode: thread pool (one-thread-per-connection)");
-    }
-
-    // 短暂等待让线程启动
-    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    LOG_INFO("Server started on " + m_ip + ":" + std::to_string(m_port));
+    LOG_INFO("Document root: " + m_docRoot);
+    LOG_INFO("Thread pool size: " + std::to_string(m_numThreads));
+    LOG_INFO(std::string("Mode: ") + (m_useEpoll ? "epoll + thread pool (hybrid)" : "thread pool (one-thread-per-connection)"));
 
     return true;
 }
@@ -350,62 +259,29 @@ void HttpServer::stop() {
     // 设置停止标志
     m_running.store(false);
 
-    // 关闭服务器socket，停止接受新连接
-    if (m_serverSocket >= 0) {
-        close(m_serverSocket);
-        m_serverSocket = -1;
+    if (m_tcpServer) {
+        m_tcpServer->stop();
     }
 
-    if (m_useEpoll) {
-        // ========== epoll模式停止 ==========
-        // 停止epoll事件循环
-        if (m_epollManager) {
-            m_epollManager->stop();
-        }
-
-        // 等待epoll事件处理线程结束
-        if (m_epollThread.joinable()) {
-            m_epollThread.join();
-        }
-
-        // 关闭线程池，等待所有任务完成
-        if (m_threadPool) {
-            m_threadPool->shutdown();
-            m_threadPool.reset();
-        }
-
-        // 关闭文件缓存
-        if (m_fileCache) {
-            m_fileCache.reset();
-        }
-
-        // 关闭所有客户端连接
-        {
-            std::lock_guard<std::mutex> lock(m_clientInfoMutex);
-            for (auto& pair : m_clientInfoMap) {
-                close(pair.first);
-            }
-            m_clientInfoMap.clear();
-        }
-
-        // 关闭epoll管理器
-        if (m_epollManager) {
-            m_epollManager->closeEpoll();
-            m_epollManager.reset();
-        }
-    } else {
-        // ========== 传统线程池模式停止 ==========
-        // 等待接受连接的线程结束
-        if (m_acceptThread.joinable()) {
-            m_acceptThread.join();
-        }
-
-        // 关闭线程池，等待所有任务完成
-        if (m_threadPool) {
-            m_threadPool->shutdown();
-            m_threadPool.reset();  // 释放智能指针
-        }
+    if (m_threadPool) {
+        m_threadPool->shutdown();
+        m_threadPool.reset();
     }
+
+    if (m_fileCache) {
+        m_fileCache.reset();
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(m_clientInfoMutex);
+        for (auto& pair : m_clientInfoMap) {
+            clearSocketReadBuffer(pair.first);
+            close(pair.first);
+        }
+        m_clientInfoMap.clear();
+    }
+
+    m_tcpServer.reset();
 
     LOG_INFO("Server stopped");
 }
@@ -598,7 +474,9 @@ std::string HttpServer::getLocalIp() const {
     socklen_t addrLen = sizeof(addr);
     
     // 获取socket绑定的地址信息
-    if (getsockname(m_serverSocket, (struct sockaddr*)&addr, &addrLen) == 0) {
+    if (m_tcpServer &&
+        m_tcpServer->getServerSocket() >= 0 &&
+        getsockname(m_tcpServer->getServerSocket(), (struct sockaddr*)&addr, &addrLen) == 0) {
         // 将网络字节序的IP地址转换为字符串格式
         inet_ntop(AF_INET, &addr.sin_addr, ip, sizeof(ip));
         return std::string(ip);
@@ -608,172 +486,62 @@ std::string HttpServer::getLocalIp() const {
 }
 
 /**
- * @brief 接受客户端连接
+ * @brief 处理已接受的客户端连接
  * 
- * 在独立线程中运行，持续接受新的客户端连接。
- * 每个新连接被包装成任务提交到线程池。
- * 
- * 工作流程：
- * 1. 等待客户端连接（accept阻塞）
- * 2. 获取客户端地址信息
- * 3. 将处理任务提交到线程池
- * 4. 继续等待下一个连接
+ * TcpServer只负责accept，本方法负责将连接交给HTTP层：
+ * - epoll模式下注册到fd监听
+ * - 传统模式下直接进入线程池处理
  */
-void HttpServer::acceptConnections() {
-    // 持续接受连接直到服务器停止
-    while (m_running.load()) {
-        struct sockaddr_in clientAddr;
-        socklen_t clientAddrLen = sizeof(clientAddr);
+void HttpServer::handleClientAccepted(int clientSocket, const std::string& clientIp, int clientPort) {
+    LOG_INFO("Client connected: " + clientIp + ":" + std::to_string(clientPort));
 
-        /**
-         * @brief 接受客户端连接
-         * 
-         * accept()会阻塞直到有客户端连接到来。
-         * 成功时返回一个新的socket描述符用于与该客户端通信。
-         * 
-         * @note 这里的clientSocket是独立的，与m_serverSocket不同
-         */
-        int clientSocket = accept(m_serverSocket, 
-                                 (struct sockaddr*)&clientAddr, 
-                                 &clientAddrLen);
-        
-        if (clientSocket < 0) {
-            // 被中断信号打断，继续等待
-            if (errno == EINTR) {
-                continue;
-            }
-            perror("accept");
-            break;  // 其他错误，退出循环
+    if (!m_useEpoll) {
+        if (!m_threadPool) {
+            close(clientSocket);
+            return;
         }
 
-        // 获取客户端IP地址和端口
-        char clientIp[INET_ADDRSTRLEN];
-        inet_ntop(AF_INET, &clientAddr.sin_addr, clientIp, sizeof(clientIp));
-        int clientPort = ntohs(clientAddr.sin_port);  // 网络字节序转主机字节序
-
-        std::cout << "Client connected: " << clientIp << ":" << clientPort << std::endl;
-
-        /**
-         * @brief 将客户端处理任务加入线程池
-         * 
-         * 使用lambda表达式捕获this指针和参数，
-         * 将处理任务提交到线程池的工作队列。
-         * 
-         * 线程池会自动分配空闲线程来执行这个任务。
-         */
         m_threadPool->enqueue([this, clientSocket, clientIp, clientPort]() {
             handleClient(clientSocket, clientIp, clientPort);
         });
-    }
-}
-
-/**
- * @brief epoll事件循环
- *
- * 在独立线程中运行，持续调用epoll_wait等待并处理IO事件。
- * 这是epoll模式的核心事件循环。
- */
-void HttpServer::epollEventLoop() {
-    LOG_INFO("Epoll event loop started");
-
-    while (m_running.load() && m_epollManager && m_epollManager->isCreated()) {
-        // 等待事件，超时时间100ms（用于定期检查running状态）
-        int nfds = m_epollManager->waitAndDispatch(100);
-
-        if (nfds < 0) {
-            LOG_ERROR("Epoll wait error");
-            break;
-        }
-
-        // 可以在这里添加额外的处理逻辑，如定时任务等
-    }
-
-    LOG_INFO("Epoll event loop stopped");
-}
-
-/**
- * @brief 处理服务器socket可读事件（epoll模式）
- *
- * 当epoll检测到服务器socket可读时调用，表示有新连接到来。
- * 接受所有可用的新连接（非阻塞模式可能一次有多个）。
- *
- * @param serverSocket 服务器socket描述符
- * @param events epoll事件标志
- */
-void HttpServer::handleServerRead(int serverSocket, uint32_t events) {
-    // 检查错误事件
-    if (events & (EPOLLERR | EPOLLHUP)) {
-        LOG_ERROR("Error on server socket");
         return;
     }
 
-    // 接受所有可用的新连接（非阻塞accept）
-    while (m_running.load()) {
-        struct sockaddr_in clientAddr;
-        socklen_t clientAddrLen = sizeof(clientAddr);
+    if (!m_tcpServer) {
+        close(clientSocket);
+        return;
+    }
 
-        int clientSocket = accept(serverSocket,
-                                 (struct sockaddr*)&clientAddr,
-                                 &clientAddrLen);
+    if (!TcpServer::setNonBlocking(clientSocket)) {
+        LOG_ERROR("Failed to set client socket to non-blocking mode");
+        close(clientSocket);
+        return;
+    }
 
-        if (clientSocket < 0) {
-            // EAGAIN/EWOULDBLOCK表示没有更多连接了
-            if (errno == EAGAIN || errno == EWOULDBLOCK) {
-                break;
-            }
-            // EINTR表示被信号中断，继续尝试
-            if (errno == EINTR) {
-                continue;
-            }
-            perror("accept");
-            break;
-        }
+    struct timeval timeout;
+    timeout.tv_sec = 0;
+    timeout.tv_usec = 100000;
+    setsockopt(clientSocket, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
+    setsockopt(clientSocket, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout));
 
-        // 获取客户端IP地址和端口
-        char clientIp[INET_ADDRSTRLEN];
-        inet_ntop(AF_INET, &clientAddr.sin_addr, clientIp, sizeof(clientIp));
-        int clientPort = ntohs(clientAddr.sin_port);
+    int nodelay = 1;
+    setsockopt(clientSocket, IPPROTO_TCP, TCP_NODELAY, &nodelay, sizeof(nodelay));
 
-        LOG_INFO("Client connected: " + std::string(clientIp) + ":" + std::to_string(clientPort));
+    {
+        std::lock_guard<std::mutex> lock(m_clientInfoMutex);
+        m_clientInfoMap[clientSocket] = {clientIp, clientPort, ""};
+    }
 
-        // 设置客户端socket为非阻塞模式
-        if (!EpollManager::setNonBlocking(clientSocket)) {
-            LOG_ERROR("Failed to set client socket to non-blocking mode");
-            close(clientSocket);
-            continue;
-        }
+    auto clientCallback = [this](int fd, uint32_t ev) {
+        this->handleClientRead(fd, ev);
+    };
 
-        // 设置socket接收超时时间：100ms
-        // ⚠️ Keep-Alive 模式下，线程池线程在阻塞 socket 上 readLine() 等待
-        // 下一个请求的数据，超时必须短，否则 500 连接会耗尽 20 个线程导致饥饿
-        struct timeval timeout;
-        timeout.tv_sec = 0;
-        timeout.tv_usec = 100000;  // 100ms
-        setsockopt(clientSocket, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
-        setsockopt(clientSocket, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout));
-
-        // 启用TCP_NODELAY，禁用Nagle算法，减少小数据包延迟
-        int nodelay = 1;
-        setsockopt(clientSocket, IPPROTO_TCP, TCP_NODELAY, &nodelay, sizeof(nodelay));
-
-        // 保存客户端信息
-        {
-            std::lock_guard<std::mutex> lock(m_clientInfoMutex);
-            m_clientInfoMap[clientSocket] = {std::string(clientIp), clientPort, ""};
-        }
-
-        // 添加客户端socket到epoll监听（水平触发模式，简化处理逻辑）
-        auto clientCallback = [this](int fd, uint32_t ev) {
-            this->handleClientRead(fd, ev);
-        };
-
-        if (!m_epollManager->addFd(clientSocket, EpollEventType::READ, clientCallback, false)) {
-            LOG_ERROR("Failed to add client socket to epoll");
-            close(clientSocket);
-            std::lock_guard<std::mutex> lock(m_clientInfoMutex);
-            m_clientInfoMap.erase(clientSocket);
-            continue;
-        }
+    if (!m_tcpServer->addFd(clientSocket, EpollEventType::READ, clientCallback, false)) {
+        LOG_ERROR("Failed to add client socket to epoll");
+        clearSocketReadBuffer(clientSocket);
+        close(clientSocket);
+        std::lock_guard<std::mutex> lock(m_clientInfoMutex);
+        m_clientInfoMap.erase(clientSocket);
     }
 }
 
@@ -813,7 +581,9 @@ void HttpServer::handleClientRead(int clientSocket, uint32_t events) {
     }
 
     // 从epoll中移除该fd（避免重复触发）
-    m_epollManager->removeFd(clientSocket);
+    if (m_tcpServer) {
+        m_tcpServer->removeFd(clientSocket);
+    }
 
     // 将socket设置为阻塞模式，确保能完整读取HTTP请求
     // 因为此时已经从epoll移除，不再需要非阻塞
@@ -845,7 +615,18 @@ void HttpServer::handleClientRead(int clientSocket, uint32_t events) {
             auto clientCallback = [this](int fd, uint32_t events) {
                 this->handleClientRead(fd, events);
             };
-            this->m_epollManager->addFd(clientSocket, EpollEventType::READ, clientCallback, false);
+            if (this->m_running.load() && this->m_tcpServer &&
+                this->m_tcpServer->addFd(clientSocket, EpollEventType::READ, clientCallback, false)) {
+                std::lock_guard<std::mutex> lock(this->m_clientInfoMutex);
+                this->m_clientInfoMap[clientSocket] = clientInfo;
+            } else {
+                {
+                    std::lock_guard<std::mutex> lock(this->m_clientInfoMutex);
+                    this->m_clientInfoMap.erase(clientSocket);
+                }
+                clearSocketReadBuffer(clientSocket);
+                close(clientSocket);
+            }
         } else {
             // 非Keep-Alive或出错：关闭socket
             clearSocketReadBuffer(clientSocket);
@@ -863,8 +644,8 @@ void HttpServer::handleClientRead(int clientSocket, uint32_t events) {
  */
 void HttpServer::cleanupClient(int clientSocket) {
     // 从epoll中移除
-    if (m_epollManager) {
-        m_epollManager->removeFd(clientSocket);
+    if (m_tcpServer) {
+        m_tcpServer->removeFd(clientSocket);
     }
     // 关闭socket
     clearSocketReadBuffer(clientSocket);

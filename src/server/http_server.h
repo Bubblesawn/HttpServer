@@ -22,7 +22,7 @@
 class ThreadPool;
 class HttpRequest;
 class HttpResponse;
-class EpollManager;  // epoll事件管理器前向声明
+class TcpServer;
 class FileCache;     // 文件缓存前向声明
 
 // 包含日志系统头文件
@@ -253,36 +253,6 @@ public:
 
 private:
     /**
-     * @brief 接受客户端连接（传统线程池模式）
-     *
-     * 在独立线程中运行，持续接受新的客户端连接。
-     * 每个新连接会被加入到线程池的任务队列中。
-     *
-     * @note 此方法在start()中启动的独立线程中运行
-     * @note 当useEpoll_为true时，此方法不使用
-     */
-    void acceptConnections();
-
-    /**
-     * @brief 使用epoll接受客户端连接
-     *
-     * 在独立线程中运行，使用epoll_wait等待连接事件。
-     * 新连接被添加到epoll监听集合中。
-     *
-     * @note 此方法在start()中启动的独立线程中运行（epoll模式）
-     */
-    void acceptConnectionsEpoll();
-
-    /**
-     * @brief 处理epoll事件循环
-     *
-     * 在独立线程中运行，调用epoll_wait等待并处理IO事件。
-     *
-     * @note 此方法在start()中启动的独立线程中运行（epoll模式）
-     */
-    void epollEventLoop();
-
-    /**
      * @brief 处理客户端可读事件（epoll模式）
      *
      * 当epoll检测到客户端socket可读时调用。
@@ -294,14 +264,15 @@ private:
     void handleClientRead(int clientSocket, uint32_t events);
 
     /**
-     * @brief 处理服务器socket可读事件（epoll模式）
+      * @brief 处理已接受的客户端连接
      *
-     * 当epoll检测到服务器socket可读时调用（有新连接到来）。
+      * 当TCP层接受到新连接时调用。
      *
-     * @param serverSocket 服务器socket描述符
-     * @param events epoll事件标志
+      * @param clientSocket 客户端socket描述符
+      * @param clientIp 客户端IP地址
+      * @param clientPort 客户端端口号
      */
-    void handleServerRead(int serverSocket, uint32_t events);
+     void handleClientAccepted(int clientSocket, const std::string& clientIp, int clientPort);
 
     /**
      * @brief 清理客户端连接资源
@@ -456,17 +427,14 @@ private:
     /** 线程池工作线程数量 */
     int m_numThreads;
 
-    /** 服务器监听socket描述符 */
-    int m_serverSocket;
-
     /** 服务器运行状态标志（原子操作保证线程安全） */
     std::atomic<bool> m_running;
 
+    /** TCP传输层封装 */
+    std::unique_ptr<TcpServer> m_tcpServer;
+
     /** 线程池智能指针 */
     std::unique_ptr<ThreadPool> m_threadPool;
-
-    /** 接受客户端连接的线程 */
-    std::thread m_acceptThread;
 
     /** 自定义请求处理函数 */
     RequestHandler m_requestHandler;
@@ -475,12 +443,6 @@ private:
 
     /** 是否使用epoll模式 */
     bool m_useEpoll;
-
-    /** epoll事件管理器 */
-    std::unique_ptr<EpollManager> m_epollManager;
-
-    /** epoll事件处理线程 */
-    std::thread m_epollThread;
 
     /** 客户端信息结构体（用于epoll模式） */
     struct ClientInfo {

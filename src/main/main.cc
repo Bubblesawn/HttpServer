@@ -166,7 +166,6 @@ std::string resolveConfigPath(const std::string& requestedPath, const char* argv
     if (fs::exists(candidate)) {
         return candidate.string();
     }
-
     return requestedPath;
 }
 
