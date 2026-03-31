@@ -21,15 +21,15 @@ RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates libstdc++6 \
     && rm -rf /var/lib/apt/lists/*
 
-WORKDIR /app
+WORKDIR /app/build
 
 RUN useradd --create-home --uid 10001 appuser
 
-COPY --from=builder /src/build/http_server_cpp /app/http_server_cpp
-COPY --from=builder /src/http_server.conf /app/http_server.conf
-COPY --from=builder /src/html_docs /app/html_docs
+COPY --from=builder /src/build/http_server_cpp /app/build/http_server_cpp
+COPY --from=builder /src/http_server.conf /app/build/http_server.conf
+COPY --from=builder /src/html_docs /app/build/html_docs
 
-RUN mkdir -p /app/logs \
+RUN mkdir -p /app/build/logs \
     && chown -R appuser:appuser /app
 
 USER appuser

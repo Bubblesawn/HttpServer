@@ -7,7 +7,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 BUILD_DIR="$PROJECT_ROOT/build"
 DEFAULT_CONFIG="$PROJECT_ROOT/http_server.conf"
-LOG_DIR="$PROJECT_ROOT/logs"
+LOG_DIR="$PROJECT_ROOT/build/logs"
 PID_FILE="$LOG_DIR/http_server.pid"
 OUT_LOG="$LOG_DIR/server.out.log"
 

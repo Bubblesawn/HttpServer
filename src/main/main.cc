@@ -407,8 +407,8 @@ int main(int argc, char* argv[]) {
     // 初始化日志系统
     // 根据配置文件中的 log_to_console 设置决定是否输出到控制台
     bool consoleOutput = (config.logToConsole != 0);
-    fs::path projectRoot = resolveProjectRoot(argv[0]);
-    fs::path logDir = projectRoot / "logs";
+    fs::path executablePath = fs::absolute(fs::path(argv[0] ? argv[0] : ""));
+    fs::path logDir = executablePath.has_parent_path() ? executablePath.parent_path() / "logs" : fs::current_path() / "logs";
     fs::create_directories(logDir);
 
     std::string accessLogPath = (logDir / "access.log").string();

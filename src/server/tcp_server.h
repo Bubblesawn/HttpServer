@@ -8,7 +8,6 @@
 
 #ifndef TCP_SERVER_H
 #define TCP_SERVER_H
-
 #include <atomic>
 #include <functional>
 #include <memory>
@@ -34,6 +33,8 @@
  * @param port 客户端端口号
  */
 using TcpAcceptCallback = std::function<void(int fd, const std::string& ip, int port)>;
+
+
 
 /**
  * @brief TCP服务器基础类
@@ -126,6 +127,7 @@ public:
      * @param callback 新连接回调函数
      */
     void setAcceptCallback(TcpAcceptCallback callback);
+   
 
     /**
      * @brief 注册一个 fd 到 epoll 管理器

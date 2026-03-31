@@ -72,7 +72,7 @@ build/http_server_cpp
 docker build -t cpp-http-server .
 docker run -d --name cpp-http-server \
 	-p 8080:8080 \
-	-v cpp_http_logs:/app/logs \
+	-v cpp_http_logs:/app/build/logs \
 	cpp-http-server
 ```
 
@@ -83,16 +83,21 @@ docker run -d --name cpp-http-server \
 ```bash
 docker run -d --name cpp-http-server \
 	-p 8081:8081 \
-	-v cpp_http_logs:/app/logs \
+	-v cpp_http_logs:/app/build/logs \
 	cpp-http-server ./http_server_cpp -c ./http_server.conf -p 8081
 ```
 
 说明：
 
-- 容器内配置文件默认位于 `/app/http_server.conf`
-- 静态资源目录默认位于 `/app/html_docs`
-- 日志默认写入 `/app/logs/`
-- `-v cpp_http_logs:/app/logs` 是推荐方式；如果你想挂载宿主机目录，先确保该目录对容器内 UID 10001 可写
+- 容器工作目录是 `/app/build`
+- 容器内配置文件默认位于 `/app/build/http_server.conf`
+- 静态资源目录默认位于 `/app/build/html_docs`
+- 日志默认写入 `/app/build/logs/`
+- `-v cpp_http_logs:/app/build/logs` 是推荐方式；如果你想挂载宿主机目录，先确保该目录对容器内 UID 10001 可写
+
+也可以直接使用仓库根目录提供的 `docker-compose.yml` 启动，便于统一端口和日志卷配置：
+
+执行命令：`docker compose up -d`
 
 ## 运行
 

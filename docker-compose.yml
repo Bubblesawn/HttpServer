@@ -1,0 +1,9 @@
+services:
+  http-server:
+    build: .
+    container_name: cpp-http-server
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./build/logs:/app/build/logs
+    restart: unless-stopped
