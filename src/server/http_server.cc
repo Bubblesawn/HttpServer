@@ -37,6 +37,8 @@
 #include <unordered_map>     // socket读取缓冲
 #include <vector>
 
+#include <nlohmann/json.hpp>
+
 // 为兼容旧版本系统，定义EPOLLRDHUP（如果未定义）
 #ifndef EPOLLRDHUP
 #define EPOLLRDHUP 0x2000
@@ -46,40 +48,29 @@ namespace {
 std::mutex g_readBufferMutex;
 std::unordered_map<int, std::string> g_socketReadBuffers;
 
-std::string jsonQuote(const std::string& value) {
-    return "\"" + HttpResponse::escapeJsonString(value) + "\"";
+nlohmann::json valueToJson(const std::string& value) {
+    const auto parsed = nlohmann::json::parse(value, nullptr, false);
+    if (!parsed.is_discarded()) {
+        return parsed;
+    }
+
+    return value;
 }
 
-void appendStringMapJson(std::ostringstream& json,
-                         const std::string& indent,
-                         const std::map<std::string, std::string>& values,
-                         bool rawValues = false) {
-    json << "{\n";
-    bool first = true;
+nlohmann::json mapToJsonObject(const std::map<std::string, std::string>& values) {
+    nlohmann::json object = nlohmann::json::object();
     for (const auto& pair : values) {
-        if (!first) {
-            json << ",\n";
-        }
-
-        json << indent << "  " << jsonQuote(pair.first) << ": ";
-        if (rawValues) {
-            const std::string& raw = pair.second;
-            if (!raw.empty() && (raw.front() == '{' || raw.front() == '[' || raw == "true" || raw == "false" || raw == "null")) {
-                json << raw;
-            } else {
-                json << jsonQuote(raw);
-            }
-        } else {
-            json << jsonQuote(pair.second);
-        }
-
-        first = false;
+        object[pair.first] = pair.second;
     }
+    return object;
+}
 
-    if (!values.empty()) {
-        json << "\n" << indent;
+nlohmann::json parsedValueMapToJsonObject(const std::map<std::string, std::string>& values) {
+    nlohmann::json object = nlohmann::json::object();
+    for (const auto& pair : values) {
+        object[pair.first] = valueToJson(pair.second);
     }
-    json << "}";
+    return object;
 }
 
 enum class RangeParseResult {
@@ -469,24 +460,21 @@ size_t HttpServer::getCacheMaxFileSize() const {
  *
  * @return std::string 缓存统计信息的JSON格式字符串
  */
-std::string HttpServer::getCacheStats() const {
+nlohmann::json HttpServer::getCacheStats() const {
     if (!m_fileCache) {
-        return "{}";
+        return nlohmann::json::object();
     }
 
-    std::ostringstream oss;
-    oss << "{";
-    oss << "\"enabled\":" << (m_fileCache->isEnabled() ? "true" : "false") << ",";
-    oss << "\"maxSize\":" << m_fileCache->getMaxSize() << ",";
-    oss << "\"currentSize\":" << m_fileCache->getCurrentSize() << ",";
-    oss << "\"maxFileSize\":" << m_fileCache->getMaxFileSize() << ",";
-    oss << "\"cacheCount\":" << m_fileCache->getCacheCount() << ",";
-    oss << "\"hitCount\":" << m_fileCache->getHitCount() << ",";
-    oss << "\"missCount\":" << m_fileCache->getMissCount() << ",";
-    oss << "\"hitRate\":" << m_fileCache->getHitRate();
-    oss << "}";
-
-    return oss.str();
+    nlohmann::json stats;
+    stats["enabled"] = m_fileCache->isEnabled();
+    stats["maxSize"] = m_fileCache->getMaxSize();
+    stats["currentSize"] = m_fileCache->getCurrentSize();
+    stats["maxFileSize"] = m_fileCache->getMaxFileSize();
+    stats["cacheCount"] = m_fileCache->getCacheCount();
+    stats["hitCount"] = m_fileCache->getHitCount();
+    stats["missCount"] = m_fileCache->getMissCount();
+    stats["hitRate"] = m_fileCache->getHitRate();
+    return stats;
 }
 
 /**
@@ -1501,28 +1489,22 @@ ssize_t HttpServer::sendData(int socket, const char* data, size_t size) const {
  * @return HttpResponse POST响应对象
  */
 HttpResponse HttpServer::handlePostRequest(const HttpRequest& request) const {
-    std::ostringstream json;
-    json << "{\n";
-    json << "  \"status\": \"success\",\n";
-    json << "  \"message\": \"POST request received\",\n";
-    json << "  \"path\": " << jsonQuote(request.getPath()) << ",\n";
-    json << "  \"bodyLength\": " << request.getBody().length() << ",\n";
-    json << "  \"contentType\": " << jsonQuote(request.getContentType()) << ",\n";
-
     const auto formData = request.parseFormData();
     const auto jsonBody = request.parseJsonBody();
-    if (!jsonBody.empty()) {
-        json << "  \"jsonBody\": ";
-        appendStringMapJson(json, "  ", jsonBody, true);
-        json << "\n";
-    } else {
-        json << "  \"formData\": ";
-        appendStringMapJson(json, "  ", formData);
-        json << "\n";
-    }
-    json << "}";
+    nlohmann::json response;
+    response["status"] = "success";
+    response["message"] = "POST request received";
+    response["path"] = request.getPath();
+    response["bodyLength"] = request.getBody().length();
+    response["contentType"] = request.getContentType();
 
-    return HttpResponse::jsonResponse(HttpResponse::STATUS_200_OK, json.str());
+    if (!jsonBody.empty()) {
+        response["jsonBody"] = parsedValueMapToJsonObject(jsonBody);
+    } else {
+        response["formData"] = mapToJsonObject(formData);
+    }
+
+    return HttpResponse::jsonResponse(HttpResponse::STATUS_200_OK, response.dump(2));
 }
 
 /**
@@ -1535,57 +1517,45 @@ HttpResponse HttpServer::handlePostRequest(const HttpRequest& request) const {
  * @return HttpResponse JSON响应对象
  */
 HttpResponse HttpServer::handleApiEcho(const HttpRequest& request) const {
-    std::ostringstream json;
-    json << "{\n";
-    json << "  \"method\": " << jsonQuote(HttpRequest::methodToString(request.getMethod())) << ",\n";
-    json << "  \"path\": " << jsonQuote(request.getPath()) << ",\n";
-    json << "  \"url\": " << jsonQuote(request.getUrl()) << ",\n";
-
-    json << "  \"queryParams\": ";
-    appendStringMapJson(json, "  ", request.parseQueryParams());
+    nlohmann::json response;
+    response["method"] = HttpRequest::methodToString(request.getMethod());
+    response["path"] = request.getPath();
+    response["url"] = request.getUrl();
+    response["queryParams"] = mapToJsonObject(request.parseQueryParams());
 
     if (request.getMethod() == HttpRequest::METHOD_POST) {
-        json << ",\n";
-        json << "  \"contentType\": " << jsonQuote(request.getContentType()) << ",\n";
-        json << "  \"body\": " << jsonQuote(request.getBody()) << ",\n";
+        response["contentType"] = request.getContentType();
+        response["body"] = request.getBody();
 
         const auto jsonBody = request.parseJsonBody();
         if (!jsonBody.empty()) {
-            json << "  \"jsonBody\": ";
-            appendStringMapJson(json, "  ", jsonBody, true);
+            response["jsonBody"] = parsedValueMapToJsonObject(jsonBody);
         } else {
-            json << "  \"formData\": ";
-            appendStringMapJson(json, "  ", request.parseFormData());
+            response["formData"] = mapToJsonObject(request.parseFormData());
         }
     }
 
-    json << "\n}";
-
-    return HttpResponse::jsonResponse(HttpResponse::STATUS_200_OK, json.str());
+    return HttpResponse::jsonResponse(HttpResponse::STATUS_200_OK, response.dump(2));
 }
 
 HttpResponse HttpServer::handleHealthCheck() const {
-    std::ostringstream json;
-    json << "{\n";
-    json << "  \"status\": \"ok\",\n";
-    json << "  \"service\": \"CppHttpServer\",\n";
-    json << "  \"routeCount\": " << m_routeHandlers.size() << "\n";
-    json << "}";
+    nlohmann::json response;
+    response["status"] = "ok";
+    response["service"] = "CppHttpServer";
+    response["routeCount"] = m_routeHandlers.size();
 
-    return HttpResponse::jsonResponse(HttpResponse::STATUS_200_OK, json.str());
+    return HttpResponse::jsonResponse(HttpResponse::STATUS_200_OK, response.dump(2));
 }
 
 HttpResponse HttpServer::handleStatusRequest() const {
-    std::ostringstream json;
-    json << "{\n";
-    json << "  \"running\": " << (m_running.load() ? "true" : "false") << ",\n";
-    json << "  \"ip\": " << jsonQuote(m_ip) << ",\n";
-    json << "  \"port\": " << m_port << ",\n";
-    json << "  \"docRoot\": " << jsonQuote(m_docRoot) << ",\n";
-    json << "  \"threads\": " << m_numThreads << ",\n";
-    json << "  \"cacheEnabled\": " << (isCacheEnabled() ? "true" : "false") << ",\n";
-    json << "  \"cacheStats\": " << getCacheStats() << "\n";
-    json << "}";
+    nlohmann::json response;
+    response["running"] = m_running.load();
+    response["ip"] = m_ip;
+    response["port"] = m_port;
+    response["docRoot"] = m_docRoot;
+    response["threads"] = m_numThreads;
+    response["cacheEnabled"] = isCacheEnabled();
+    response["cacheStats"] = getCacheStats();
 
-    return HttpResponse::jsonResponse(HttpResponse::STATUS_200_OK, json.str());
+    return HttpResponse::jsonResponse(HttpResponse::STATUS_200_OK, response.dump(2));
 }

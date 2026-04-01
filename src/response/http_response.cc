@@ -11,6 +11,8 @@
 #include <sys/stat.h>      // 文件状态
 #include <iostream>        // 输入输出
 
+#include <nlohmann/json.hpp>
+
 namespace {
 
 void appendSerializedHeaders(std::string& result, const HttpResponse& response, size_t contentLength) {
@@ -380,20 +382,18 @@ HttpResponse HttpResponse::jsonResponse(StatusCode code, const std::string& json
  * @brief 创建JSON错误响应
  * 
  * 生成统一的JSON错误包裹格式。
+ * 使用nlohmann::json构造响应体，避免手动拼接和转义错误。
  * 
  * @param code 状态码
  * @param message 错误消息
  * @return HttpResponse JSON错误响应对象
  */
 HttpResponse HttpResponse::jsonError(StatusCode code, const std::string& message) {
-    std::string json = "{\n";
-    json += "  \"error\": {\n";
-    json += "    \"code\": " + std::to_string(static_cast<int>(code)) + ",\n";
-    json += "    \"message\": \"" + escapeJsonString(message) + "\"\n";
-    json += "  }\n";
-    json += "}";
+    nlohmann::json json;
+    json["error"]["code"] = static_cast<int>(code);
+    json["error"]["message"] = message;
 
-    return jsonResponse(code, json);
+    return jsonResponse(code, json.dump(2));
 }
 
 /**

@@ -18,12 +18,15 @@
 #include <unordered_map>   // 哈希映射
 #include <mutex>           // 互斥锁
 
+#include <nlohmann/json.hpp>
+
 // 前向声明 - 避免循环依赖
 class ThreadPool;
 class HttpRequest;
 class HttpResponse;
 class TcpServer;
 class FileCache;     // 文件缓存前向声明
+
 
 // 请求方法类型需要完整定义
 #include "../request/http_request.h"
@@ -214,9 +217,9 @@ public:
     /**
      * @brief 获取缓存统计信息
      * 
-     * @return std::string 缓存统计信息的JSON格式字符串
+        * @return nlohmann::json 缓存统计信息对象
      */
-    std::string getCacheStats() const;
+        nlohmann::json getCacheStats() const;
 
     /**
      * @brief 清空文件缓存

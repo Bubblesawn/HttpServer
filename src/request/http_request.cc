@@ -12,25 +12,9 @@
 #include <cstring>       // C字符串处理
 #include <cctype>
 
+#include <nlohmann/json.hpp>
+
 namespace {
-
-/**
- * @brief 去除字符串两端的空白字符
- *
- * 用于在解析请求参数和JSON片段时清理多余空白，避免空格和换行影响匹配结果。
- *
- * @param input 原始字符串
- * @return std::string 去除首尾空白后的字符串
- */
-std::string trimWhitespace(const std::string& input) {
-    const size_t start = input.find_first_not_of(" \t\r\n");
-    if (start == std::string::npos) {
-        return "";
-    }
-
-    const size_t end = input.find_last_not_of(" \t\r\n");
-    return input.substr(start, end - start + 1);
-}
 
 /**
  * @brief 生成字符串的小写副本
@@ -88,215 +72,6 @@ std::map<std::string, std::string> parseUrlEncodedPairs(const std::string& encod
     }
 
     return params;
-}
-
-/**
- * @brief 解析JSON字符串字面量
- *
- * 处理带引号的JSON字符串，支持常见转义字符与\u 转义的原样保留。
- * 该函数仅负责解析字符串标记，不处理外层对象结构。
- *
- * @param input JSON文本
- * @param position 当前解析位置，成功时会前移到结束引号之后
- * @param output 解析后的字符串内容
- * @return bool 解析成功返回true，否则返回false
- */
-bool parseJsonString(const std::string& input, size_t& position, std::string& output) {
-    if (position >= input.length() || input[position] != '"') {
-        return false;
-    }
-
-    ++position;
-    output.clear();
-    while (position < input.length()) {
-        char ch = input[position++];
-        if (ch == '"') {
-            return true;
-        }
-
-        if (ch == '\\') {
-            if (position >= input.length()) {
-                return false;
-            }
-
-            char escaped = input[position++];
-            switch (escaped) {
-                case '"': output.push_back('"'); break;
-                case '\\': output.push_back('\\'); break;
-                case '/': output.push_back('/'); break;
-                case 'b': output.push_back('\b'); break;
-                case 'f': output.push_back('\f'); break;
-                case 'n': output.push_back('\n'); break;
-                case 'r': output.push_back('\r'); break;
-                case 't': output.push_back('\t'); break;
-                case 'u':
-                    if (position + 3 >= input.length()) {
-                        return false;
-                    }
-                    output.push_back('\\');
-                    output.push_back('u');
-                    output.push_back(input[position++]);
-                    output.push_back(input[position++]);
-                    output.push_back(input[position++]);
-                    output.push_back(input[position++]);
-                    break;
-                default:
-                    output.push_back(escaped);
-                    break;
-            }
-            continue;
-        }
-
-        output.push_back(ch);
-    }
-
-    return false;
-}
-
-/**
- * @brief 解析JSON值片段
- *
- * 该函数用于从对象字段值位置提取一个完整的JSON值文本。
- * 如果值是字符串，会返回去引号后的字符串内容；
- * 如果值是对象、数组、数字、布尔值或null，则返回对应的原始文本。
- *
- * @param input JSON文本
- * @param position 当前解析位置，成功时会前移到值结束位置
- * @return std::string 解析得到的值文本，失败时返回空字符串
- */
-std::string parseJsonValueToken(const std::string& input, size_t& position) {
-    while (position < input.length() && std::isspace(static_cast<unsigned char>(input[position]))) {
-        ++position;
-    }
-
-    if (position >= input.length()) {
-        return "";
-    }
-
-    if (input[position] == '"') {
-        std::string value;
-        if (!parseJsonString(input, position, value)) {
-            return "";
-        }
-        return value;
-    }
-
-    const size_t start = position;
-    int braceDepth = 0;
-    int bracketDepth = 0;
-    bool inString = false;
-    bool escaped = false;
-
-    while (position < input.length()) {
-        char ch = input[position];
-        if (inString) {
-            if (escaped) {
-                escaped = false;
-            } else if (ch == '\\') {
-                escaped = true;
-            } else if (ch == '"') {
-                inString = false;
-            }
-            ++position;
-            continue;
-        }
-
-        if (ch == '"') {
-            inString = true;
-            ++position;
-            continue;
-        }
-
-        if (ch == '{') {
-            ++braceDepth;
-        } else if (ch == '}') {
-            if (braceDepth == 0 && bracketDepth == 0) {
-                break;
-            }
-            --braceDepth;
-        } else if (ch == '[') {
-            ++bracketDepth;
-        } else if (ch == ']') {
-            --bracketDepth;
-        } else if (ch == ',' && braceDepth == 0 && bracketDepth == 0) {
-            break;
-        }
-
-        ++position;
-    }
-
-    return trimWhitespace(input.substr(start, position - start));
-}
-
-/**
- * @brief 解析顶层JSON对象
- *
- * 仅支持标准对象结构，返回对象中的字段映射。
- * 该实现的目标是满足HTTP请求参数提取场景，而不是完整的JSON DOM 解析器。
- *
- * @param body JSON请求体文本
- * @return std::map<std::string, std::string> 顶层键值对
- */
-std::map<std::string, std::string> parseJsonObjectBody(const std::string& body) {
-    std::map<std::string, std::string> values;
-    size_t position = 0;
-
-    while (position < body.length() && std::isspace(static_cast<unsigned char>(body[position]))) {
-        ++position;
-    }
-
-    if (position >= body.length() || body[position] != '{') {
-        return values;
-    }
-    ++position;
-
-    while (position < body.length()) {
-        while (position < body.length() && std::isspace(static_cast<unsigned char>(body[position]))) {
-            ++position;
-        }
-
-        if (position < body.length() && body[position] == '}') {
-            ++position;
-            break;
-        }
-
-        std::string key;
-        if (!parseJsonString(body, position, key)) {
-            return std::map<std::string, std::string>();
-        }
-
-        while (position < body.length() && std::isspace(static_cast<unsigned char>(body[position]))) {
-            ++position;
-        }
-
-        if (position >= body.length() || body[position] != ':') {
-            return std::map<std::string, std::string>();
-        }
-        ++position;
-
-        std::string value = parseJsonValueToken(body, position);
-        values[key] = value;
-
-        while (position < body.length() && std::isspace(static_cast<unsigned char>(body[position]))) {
-            ++position;
-        }
-
-        if (position < body.length() && body[position] == ',') {
-            ++position;
-            continue;
-        }
-
-        if (position < body.length() && body[position] == '}') {
-            ++position;
-            break;
-        }
-
-        if (position < body.length()) {
-            return std::map<std::string, std::string>();
-        }
-    }
-
-    return values;
 }
 
 } // namespace
@@ -678,7 +453,21 @@ std::map<std::string, std::string> HttpRequest::parseJsonBody() const {
         return {};
     }
 
-    return parseJsonObjectBody(m_body);
+    const auto parsed = nlohmann::json::parse(m_body, nullptr, false);
+    if (parsed.is_discarded() || !parsed.is_object()) {
+        return {};
+    }
+
+    std::map<std::string, std::string> values;
+    for (const auto& item : parsed.items()) {
+        if (item.value().is_string()) {
+            values[item.key()] = item.value().get<std::string>();
+        } else {
+            values[item.key()] = item.value().dump();
+        }
+    }
+
+    return values;
 }
 
 /**
