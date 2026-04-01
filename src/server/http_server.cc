@@ -11,6 +11,7 @@
 #include "../response/http_response.h"
 #include "../thread/thread_pool.h"
 #include "../cache/file_cache.h"
+#include "../server/tcp_server.h"
 #include <thread>
 
 // POSIX网络编程头文件
@@ -34,6 +35,9 @@
 #include <limits>           // 数值边界
 #include <iostream>          // 输入输出
 #include <unordered_map>     // socket读取缓冲
+#include <vector>
+
+#include <nlohmann/json.hpp>
 
 // 为兼容旧版本系统，定义EPOLLRDHUP（如果未定义）
 #ifndef EPOLLRDHUP
@@ -43,6 +47,78 @@
 namespace {
 std::mutex g_readBufferMutex;
 std::unordered_map<int, std::string> g_socketReadBuffers;
+
+std::string toLowerCopy(const std::string& input) {
+    std::string output = input;
+    std::transform(output.begin(), output.end(), output.begin(), [](unsigned char ch) {
+        return static_cast<char>(std::tolower(ch));
+    });
+    return output;
+}
+
+std::vector<std::string> splitPathSegments(const std::string& path) {
+    std::vector<std::string> segments;
+    size_t start = 0;
+
+    while (start < path.length()) {
+        while (start < path.length() && path[start] == '/') {
+            ++start;
+        }
+
+        size_t end = start;
+        while (end < path.length() && path[end] != '/') {
+            ++end;
+        }
+
+        if (end > start) {
+            segments.emplace_back(path.substr(start, end - start));
+        }
+
+        start = end + 1;
+    }
+
+    return segments;
+}
+
+bool containsJsonAcceptHeader(const HttpRequest& request) {
+    const std::string accept = toLowerCopy(request.getHeader("Accept"));
+    if (accept.find("application/json") != std::string::npos) {
+        return true;
+    }
+
+    const std::string contentType = toLowerCopy(request.getContentType());
+    if (contentType.find("application/json") != std::string::npos ||
+        contentType.find("+json") != std::string::npos) {
+        return true;
+    }
+
+    return request.getPath().rfind("/api/", 0) == 0;
+}
+
+nlohmann::json valueToJson(const std::string& value) {
+    const auto parsed = nlohmann::json::parse(value, nullptr, false);
+    if (!parsed.is_discarded()) {
+        return parsed;
+    }
+
+    return value;
+}
+
+nlohmann::json mapToJsonObject(const std::map<std::string, std::string>& values) {
+    nlohmann::json object = nlohmann::json::object();
+    for (const auto& pair : values) {
+        object[pair.first] = pair.second;
+    }
+    return object;
+}
+
+nlohmann::json parsedValueMapToJsonObject(const std::map<std::string, std::string>& values) {
+    nlohmann::json object = nlohmann::json::object();
+    for (const auto& pair : values) {
+        object[pair.first] = valueToJson(pair.second);
+    }
+    return object;
+}
 
 enum class RangeParseResult {
     NOT_PRESENT,
@@ -151,6 +227,13 @@ void clearSocketReadBuffer(int fd) {
     std::lock_guard<std::mutex> lock(g_readBufferMutex);
     g_socketReadBuffers.erase(fd);
 }
+
+void stripResponseBodyForHead(HttpResponse& response) {
+    const std::string contentType = response.getContentType();
+    response.setBody("");
+    response.setFilePath("");
+    response.setContentType(contentType);
+}
 } // namespace
 
 /**
@@ -166,8 +249,9 @@ HttpServer::HttpServer(const std::string& ip, int port)
     , m_port(port)
     , m_docRoot("./html_docs")    // 默认文档根目录
     , m_numThreads(std::thread::hardware_concurrency() * 2)  // 默认线程数为CPU核心数的2倍，提高并发处理能力
-    , m_serverSocket(-1)         // 初始化为无效socket
     , m_running(false)            // 初始状态为未运行
+    , m_tcpServer(nullptr)
+    , m_requestCounter(0)        // 请求ID计数器初始化为0
     , m_useEpoll(true)           // 默认启用epoll模式
     , m_fileCache(nullptr) {     // 文件缓存初始化为nullptr
     /**
@@ -179,6 +263,18 @@ HttpServer::HttpServer(const std::string& ip, int port)
      * 常见场景：客户端提前关闭连接，但服务器仍在发送数据
      */
     signal(SIGPIPE, SIG_IGN);
+
+    registerDefaultRoutes();
+
+    addMiddleware([this](const HttpRequest& request, HttpResponse& response, const std::function<void()>& next) {
+        const uint64_t requestId = m_requestCounter.fetch_add(1, std::memory_order_relaxed) + 1;
+        response.addHeader("X-Request-Id", std::to_string(requestId));
+        next();
+        response.addHeader("X-Content-Type-Options", "nosniff");
+        if (request.getMethod() == HttpRequest::METHOD_OPTIONS) {
+            response.addHeader("Access-Control-Allow-Origin", "*");
+        }
+    });
 }
 
 /**
@@ -209,124 +305,32 @@ bool HttpServer::start() {
         return false;
     }
 
-    // 创建TCP socket
-    // AF_INET: IPv4协议
-    // SOCK_STREAM: 面向连接的可靠数据传输（TCP）
-    m_serverSocket = socket(AF_INET, SOCK_STREAM, 0);
-    if (m_serverSocket < 0) {
-        perror("socket");  // 输出错误信息到stderr
+    m_threadPool = std::make_unique<ThreadPool>(m_numThreads);
+    m_fileCache = std::make_unique<FileCache>();
+    m_tcpServer = std::make_unique<TcpServer>(m_ip, m_port, m_useEpoll);
+
+    m_tcpServer->setAcceptCallback([this](int clientSocket, const std::string& clientIp, int clientPort) {
+        this->handleClientAccepted(clientSocket, clientIp, clientPort);
+    });
+
+    if (!m_tcpServer->start()) {
+        LOG_ERROR("Failed to start TCP server");
+        if (m_threadPool) {
+            m_threadPool->shutdown();
+            m_threadPool.reset();
+        }
+        m_fileCache.reset();
+        m_tcpServer.reset();
+        m_running.store(false);
         return false;
     }
 
-    /**
-     * @brief 设置socket选项 - 地址重用
-     * 
-     * SO_REUSEADDR允许在服务器关闭后立即重新绑定到相同端口，
-     * 而不需要等待操作系统释放端口（通常有TIME_WAIT状态）。
-     * 
-     * 这在开发调试时特别有用，可以快速重启服务器。
-     */
-    int opt = 1;
-    if (setsockopt(m_serverSocket, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt)) < 0) {
-        perror("setsockopt(SO_REUSEADDR)");
-    }
-
-    // 准备服务器地址结构
-    struct sockaddr_in serverAddr;
-    memset(&serverAddr, 0, sizeof(serverAddr));  // 清零结构体
-    
-    serverAddr.sin_family = AF_INET;                    // IPv4
-    serverAddr.sin_port = htons(m_port);               // 端口号（主机字节序转网络字节序）
-    serverAddr.sin_addr.s_addr = inet_addr(m_ip.c_str());  // IP地址
-
-    // 绑定地址和端口到socket
-    if (bind(m_serverSocket, (struct sockaddr*)&serverAddr, sizeof(serverAddr)) < 0) {
-        perror("bind");
-        close(m_serverSocket);      // 绑定失败，关闭socket
-        m_serverSocket = -1;
-        return false;
-    }
-
-    // 开始监听连接请求
-    // SOMAXCONN: 使用系统允许的最大等待队列长度，支持高并发连接
-    if (listen(m_serverSocket, SOMAXCONN) < 0) {
-        perror("listen");
-        close(m_serverSocket);
-        m_serverSocket = -1;
-        return false;
-    }
-
-    // 设置服务器为运行状态
     m_running.store(true);
 
-    // 根据模式选择启动方式
-    if (m_useEpoll) {
-        // ========== epoll模式 ==========
-        // 创建线程池（用于处理请求）
-        m_threadPool = std::make_unique<ThreadPool>(m_numThreads);
-
-        // 创建文件缓存
-        m_fileCache = std::make_unique<FileCache>();
-
-        // 创建epoll管理器
-        m_epollManager = std::make_unique<EpollManager>();
-        if (!m_epollManager->create()) {
-            LOG_ERROR("Failed to create epoll instance");
-            close(m_serverSocket);
-            m_serverSocket = -1;
-            m_running.store(false);
-            return false;
-        }
-
-        // 设置服务器socket为非阻塞模式
-        if (!EpollManager::setNonBlocking(m_serverSocket)) {
-            LOG_ERROR("Failed to set server socket to non-blocking mode");
-            m_epollManager->closeEpoll();
-            close(m_serverSocket);
-            m_serverSocket = -1;
-            m_running.store(false);
-            return false;
-        }
-
-        // 添加服务器socket到epoll监听（水平触发模式，避免遗漏连接）
-        auto serverCallback = [this](int fd, uint32_t events) {
-            this->handleServerRead(fd, events);
-        };
-        if (!m_epollManager->addFd(m_serverSocket, EpollEventType::READ, serverCallback, false)) {
-            LOG_ERROR("Failed to add server socket to epoll");
-            m_epollManager->closeEpoll();
-            close(m_serverSocket);
-            m_serverSocket = -1;
-            m_running.store(false);
-            return false;
-        }
-
-        // 启动epoll事件处理线程
-        m_epollThread = std::thread(&HttpServer::epollEventLoop, this);
-
-        LOG_INFO("Server started on " + m_ip + ":" + std::to_string(m_port));
-        LOG_INFO("Document root: " + m_docRoot);
-        LOG_INFO("Thread pool size: " + std::to_string(m_numThreads));
-        LOG_INFO("Mode: epoll + thread pool (hybrid)");
-    } else {
-        // ========== 传统线程池模式 ==========
-        // 创建线程池
-        m_threadPool = std::make_unique<ThreadPool>(m_numThreads);
-
-        // 创建文件缓存
-        m_fileCache = std::make_unique<FileCache>();
-
-        // 启动接受连接的线程
-        m_acceptThread = std::thread(&HttpServer::acceptConnections, this);
-
-        LOG_INFO("Server started on " + m_ip + ":" + std::to_string(m_port));
-        LOG_INFO("Document root: " + m_docRoot);
-        LOG_INFO("Thread pool size: " + std::to_string(m_numThreads));
-        LOG_INFO("Mode: thread pool (one-thread-per-connection)");
-    }
-
-    // 短暂等待让线程启动
-    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    LOG_INFO("Server started on " + m_ip + ":" + std::to_string(m_port));
+    LOG_INFO("Document root: " + m_docRoot);
+    LOG_INFO("Thread pool size: " + std::to_string(m_numThreads));
+    LOG_INFO(std::string("Mode: ") + (m_useEpoll ? "epoll + thread pool (hybrid)" : "thread pool (one-thread-per-connection)"));
 
     return true;
 }
@@ -350,62 +354,29 @@ void HttpServer::stop() {
     // 设置停止标志
     m_running.store(false);
 
-    // 关闭服务器socket，停止接受新连接
-    if (m_serverSocket >= 0) {
-        close(m_serverSocket);
-        m_serverSocket = -1;
+    if (m_tcpServer) {
+        m_tcpServer->stop();
     }
 
-    if (m_useEpoll) {
-        // ========== epoll模式停止 ==========
-        // 停止epoll事件循环
-        if (m_epollManager) {
-            m_epollManager->stop();
-        }
-
-        // 等待epoll事件处理线程结束
-        if (m_epollThread.joinable()) {
-            m_epollThread.join();
-        }
-
-        // 关闭线程池，等待所有任务完成
-        if (m_threadPool) {
-            m_threadPool->shutdown();
-            m_threadPool.reset();
-        }
-
-        // 关闭文件缓存
-        if (m_fileCache) {
-            m_fileCache.reset();
-        }
-
-        // 关闭所有客户端连接
-        {
-            std::lock_guard<std::mutex> lock(m_clientInfoMutex);
-            for (auto& pair : m_clientInfoMap) {
-                close(pair.first);
-            }
-            m_clientInfoMap.clear();
-        }
-
-        // 关闭epoll管理器
-        if (m_epollManager) {
-            m_epollManager->closeEpoll();
-            m_epollManager.reset();
-        }
-    } else {
-        // ========== 传统线程池模式停止 ==========
-        // 等待接受连接的线程结束
-        if (m_acceptThread.joinable()) {
-            m_acceptThread.join();
-        }
-
-        // 关闭线程池，等待所有任务完成
-        if (m_threadPool) {
-            m_threadPool->shutdown();
-            m_threadPool.reset();  // 释放智能指针
-        }
+    if (m_threadPool) {
+        m_threadPool->shutdown();
+        m_threadPool.reset();
     }
+
+    if (m_fileCache) {
+        m_fileCache.reset();
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(m_clientInfoMutex);
+        for (auto& pair : m_clientInfoMap) {
+            clearSocketReadBuffer(pair.first);
+            close(pair.first);
+        }
+        m_clientInfoMap.clear();
+    }
+
+    m_tcpServer.reset();
 
     LOG_INFO("Server stopped");
 }
@@ -547,24 +518,21 @@ size_t HttpServer::getCacheMaxFileSize() const {
  *
  * @return std::string 缓存统计信息的JSON格式字符串
  */
-std::string HttpServer::getCacheStats() const {
+nlohmann::json HttpServer::getCacheStats() const {
     if (!m_fileCache) {
-        return "{}";
+        return nlohmann::json::object();
     }
 
-    std::ostringstream oss;
-    oss << "{";
-    oss << "\"enabled\":" << (m_fileCache->isEnabled() ? "true" : "false") << ",";
-    oss << "\"maxSize\":" << m_fileCache->getMaxSize() << ",";
-    oss << "\"currentSize\":" << m_fileCache->getCurrentSize() << ",";
-    oss << "\"maxFileSize\":" << m_fileCache->getMaxFileSize() << ",";
-    oss << "\"cacheCount\":" << m_fileCache->getCacheCount() << ",";
-    oss << "\"hitCount\":" << m_fileCache->getHitCount() << ",";
-    oss << "\"missCount\":" << m_fileCache->getMissCount() << ",";
-    oss << "\"hitRate\":" << m_fileCache->getHitRate();
-    oss << "}";
-
-    return oss.str();
+    nlohmann::json stats;
+    stats["enabled"] = m_fileCache->isEnabled();
+    stats["maxSize"] = m_fileCache->getMaxSize();
+    stats["currentSize"] = m_fileCache->getCurrentSize();
+    stats["maxFileSize"] = m_fileCache->getMaxFileSize();
+    stats["cacheCount"] = m_fileCache->getCacheCount();
+    stats["hitCount"] = m_fileCache->getHitCount();
+    stats["missCount"] = m_fileCache->getMissCount();
+    stats["hitRate"] = m_fileCache->getHitRate();
+    return stats;
 }
 
 /**
@@ -574,6 +542,264 @@ void HttpServer::clearCache() {
     if (m_fileCache) {
         m_fileCache->clear();
     }
+}
+
+void HttpServer::addMiddleware(Middleware middleware) {
+    if (middleware) {
+        m_middlewares.push_back(std::move(middleware));
+    }
+}
+
+void HttpServer::clearMiddlewares() {
+    m_middlewares.clear();
+}
+
+std::string HttpServer::buildRouteKey(HttpRequest::Method method, const std::string& path) const {
+    return HttpRequest::methodToString(method) + " " + path;
+}
+
+bool HttpServer::matchRoutePattern(const std::string& pattern,
+                                   const std::string& path,
+                                   std::map<std::string, std::string>& pathParams) const {
+    const auto patternSegments = splitPathSegments(pattern);
+    const auto pathSegments = splitPathSegments(path);
+
+    if (patternSegments.size() != pathSegments.size()) {
+        return false;
+    }
+
+    pathParams.clear();
+    for (size_t index = 0; index < patternSegments.size(); ++index) {
+        const std::string& patternSegment = patternSegments[index];
+        const std::string& pathSegment = pathSegments[index];
+
+        if (patternSegment.size() >= 3 && patternSegment.front() == '{' && patternSegment.back() == '}') {
+            pathParams[patternSegment.substr(1, patternSegment.size() - 2)] = pathSegment;
+            continue;
+        }
+
+        if (patternSegment != pathSegment) {
+            return false;
+        }
+    }
+
+    return true;
+}
+
+std::string HttpServer::getAllowedMethodsForPath(const std::string& path) const {
+    std::vector<std::string> methods;
+    for (const auto& pair : m_routeHandlers) {
+        const std::string suffix = " " + path;
+        if (pair.first.size() > suffix.size() &&
+            pair.first.compare(pair.first.size() - suffix.size(), suffix.size(), suffix) == 0) {
+            methods.push_back(pair.first.substr(0, pair.first.size() - suffix.size()));
+        }
+    }
+
+    for (const auto& routePattern : m_routePatterns) {
+        std::map<std::string, std::string> pathParams;
+        if (matchRoutePattern(routePattern.pattern, path, pathParams)) {
+            methods.push_back(HttpRequest::methodToString(routePattern.method));
+        }
+    }
+
+    if (methods.empty()) {
+        return "GET, HEAD, OPTIONS";
+    }
+
+    std::sort(methods.begin(), methods.end());
+    methods.erase(std::unique(methods.begin(), methods.end()), methods.end());
+
+    std::ostringstream allow;
+    for (size_t index = 0; index < methods.size(); ++index) {
+        if (index > 0) {
+            allow << ", ";
+        }
+        allow << methods[index];
+    }
+
+    if (std::find(methods.begin(), methods.end(), "OPTIONS") == methods.end()) {
+        if (!methods.empty()) {
+            allow << ", ";
+        }
+        allow << "OPTIONS";
+    }
+
+    return allow.str();
+}
+
+void HttpServer::registerRoute(HttpRequest::Method method, const std::string& path, RequestHandler handler) {
+    m_routeHandlers[buildRouteKey(method, path)] = std::move(handler);
+}
+
+void HttpServer::registerRoutePattern(HttpRequest::Method method, const std::string& pathPattern, RequestHandler handler) {
+    m_routePatterns.push_back({method, pathPattern, std::move(handler)});
+}
+
+void HttpServer::registerDefaultRoutes() {
+    m_routeHandlers.clear();
+    m_routePatterns.clear();
+
+    registerRoute(HttpRequest::METHOD_GET, "/api/echo", [this](const HttpRequest& request) {
+        return handleApiEcho(request);
+    });
+    registerRoute(HttpRequest::METHOD_HEAD, "/api/echo", [this](const HttpRequest& request) {
+        return handleApiEcho(request);
+    });
+    registerRoute(HttpRequest::METHOD_POST, "/api/echo", [this](const HttpRequest& request) {
+        return handleApiEcho(request);
+    });
+
+    registerRoute(HttpRequest::METHOD_GET, "/health", [this](const HttpRequest&) {
+        return handleHealthCheck();
+    });
+    registerRoute(HttpRequest::METHOD_HEAD, "/health", [this](const HttpRequest&) {
+        return handleHealthCheck();
+    });
+
+    registerRoute(HttpRequest::METHOD_GET, "/status", [this](const HttpRequest&) {
+        return handleStatusRequest();
+    });
+    registerRoute(HttpRequest::METHOD_HEAD, "/status", [this](const HttpRequest&) {
+        return handleStatusRequest();
+    });
+}
+
+bool HttpServer::dispatchRoute(const HttpRequest& request, HttpResponse& response) const {
+    const std::string routeKey = buildRouteKey(request.getMethod(), request.getPath());
+    const auto it = m_routeHandlers.find(routeKey);
+    if (it == m_routeHandlers.end()) {
+        for (const auto& routePattern : m_routePatterns) {
+            if (routePattern.method != request.getMethod()) {
+                continue;
+            }
+
+            std::map<std::string, std::string> pathParams;
+            if (!matchRoutePattern(routePattern.pattern, request.getPath(), pathParams)) {
+                continue;
+            }
+
+            HttpRequest routedRequest = request;
+            routedRequest.setPathParams(pathParams);
+            response = routePattern.handler(routedRequest);
+            return true;
+        }
+
+        return false;
+    }
+
+    response = it->second(request);
+    return true;
+}
+
+void HttpServer::runMiddlewareChain(size_t index,
+                                    const HttpRequest& request,
+                                    HttpResponse& response,
+                                    const std::function<void()>& finalHandler) const {
+    if (index >= m_middlewares.size()) {
+        finalHandler();
+        return;
+    }
+
+    const Middleware& middleware = m_middlewares[index];
+    middleware(request, response, [this, index, &request, &response, &finalHandler]() {
+        runMiddlewareChain(index + 1, request, response, finalHandler);
+    });
+}
+
+void HttpServer::processRequest(HttpRequest& request, HttpResponse& response) const {
+    const std::map<std::string, std::string> middlewareHeaders = response.getHeaders();
+
+    HttpResponse generatedResponse;
+    if (m_requestHandler) {
+        generatedResponse = m_requestHandler(request);
+    } else if (!dispatchRoute(request, generatedResponse)) {
+        if (request.getMethod() == HttpRequest::METHOD_GET ||
+            request.getMethod() == HttpRequest::METHOD_HEAD) {
+            generatedResponse = handleStaticFile(request);
+        } else if (request.getMethod() == HttpRequest::METHOD_POST) {
+            generatedResponse = handlePostRequest(request);
+        } else if (request.getMethod() == HttpRequest::METHOD_OPTIONS) {
+            generatedResponse.setStatusCode(HttpResponse::STATUS_204_NO_CONTENT);
+            generatedResponse.addHeader("Allow", getAllowedMethodsForPath(request.getPath()));
+            generatedResponse.setBody("");
+        } else if (request.getMethod() == HttpRequest::METHOD_PUT ||
+                   request.getMethod() == HttpRequest::METHOD_DELETE) {
+            generatedResponse = buildUnifiedErrorResponse(request,
+                                                          HttpResponse::STATUS_405_METHOD_NOT_ALLOWED,
+                                                          "",
+                                                          getAllowedMethodsForPath(request.getPath()));
+        } else {
+            generatedResponse = buildUnifiedErrorResponse(request,
+                                                          HttpResponse::STATUS_501_NOT_IMPLEMENTED,
+                                                          "Unsupported HTTP method");
+        }
+    }
+
+    for (const auto& header : middlewareHeaders) {
+        if (generatedResponse.getHeader(header.first).empty()) {
+            generatedResponse.addHeader(header.first, header.second);
+        }
+    }
+
+    response = std::move(generatedResponse);
+}
+
+HttpResponse HttpServer::buildUnifiedErrorResponse(const HttpRequest& request,
+                                                   int code,
+                                                   const std::string& detail,
+                                                   const std::string& allowMethods) const {
+    const auto statusCode = static_cast<HttpResponse::StatusCode>(code);
+
+    if (containsJsonAcceptHeader(request)) {
+        HttpResponse response = HttpResponse::jsonError(statusCode, detail.empty() ? HttpResponse::statusCodeToString(statusCode) : detail);
+        if (!allowMethods.empty()) {
+            response.addHeader("Allow", allowMethods);
+        }
+        return response;
+    }
+
+    switch (statusCode) {
+        case HttpResponse::STATUS_400_BAD_REQUEST:
+            return HttpResponse::badRequest();
+        case HttpResponse::STATUS_404_NOT_FOUND:
+            return HttpResponse::notFound();
+        case HttpResponse::STATUS_405_METHOD_NOT_ALLOWED:
+            return allowMethods.empty() ? HttpResponse::methodNotAllowed() : HttpResponse::methodNotAllowed(allowMethods);
+        case HttpResponse::STATUS_500_INTERNAL_SERVER_ERROR:
+            return HttpResponse::internalServerError();
+        case HttpResponse::STATUS_501_NOT_IMPLEMENTED:
+            return HttpResponse::notImplemented();
+        default: {
+            HttpResponse response;
+            response.setStatusCode(statusCode);
+            response.setContentType("text/plain; charset=utf-8");
+            response.setBody(detail.empty() ? HttpResponse::statusCodeToString(statusCode) : detail);
+            return response;
+        }
+    }
+}
+
+HttpResponse HttpServer::handleRequest(HttpRequest request) const {
+    HttpResponse response;
+
+    try {
+        auto finalHandler = [&]() {
+            processRequest(request, response);
+        };
+
+        runMiddlewareChain(0, request, response, finalHandler);
+
+        if (request.getMethod() == HttpRequest::METHOD_HEAD) {
+            stripResponseBodyForHead(response);
+        }
+    } catch (const std::exception& e) {
+        response = buildUnifiedErrorResponse(request,
+                                             HttpResponse::STATUS_500_INTERNAL_SERVER_ERROR,
+                                             e.what());
+    }
+
+    return response;
 }
 
 /**
@@ -598,7 +824,9 @@ std::string HttpServer::getLocalIp() const {
     socklen_t addrLen = sizeof(addr);
     
     // 获取socket绑定的地址信息
-    if (getsockname(m_serverSocket, (struct sockaddr*)&addr, &addrLen) == 0) {
+    if (m_tcpServer &&
+        m_tcpServer->getServerSocket() >= 0 &&
+        getsockname(m_tcpServer->getServerSocket(), (struct sockaddr*)&addr, &addrLen) == 0) {
         // 将网络字节序的IP地址转换为字符串格式
         inet_ntop(AF_INET, &addr.sin_addr, ip, sizeof(ip));
         return std::string(ip);
@@ -608,172 +836,62 @@ std::string HttpServer::getLocalIp() const {
 }
 
 /**
- * @brief 接受客户端连接
+ * @brief 处理已接受的客户端连接
  * 
- * 在独立线程中运行，持续接受新的客户端连接。
- * 每个新连接被包装成任务提交到线程池。
- * 
- * 工作流程：
- * 1. 等待客户端连接（accept阻塞）
- * 2. 获取客户端地址信息
- * 3. 将处理任务提交到线程池
- * 4. 继续等待下一个连接
+ * TcpServer只负责accept，本方法负责将连接交给HTTP层：
+ * - epoll模式下注册到fd监听
+ * - 传统模式下直接进入线程池处理
  */
-void HttpServer::acceptConnections() {
-    // 持续接受连接直到服务器停止
-    while (m_running.load()) {
-        struct sockaddr_in clientAddr;
-        socklen_t clientAddrLen = sizeof(clientAddr);
+void HttpServer::handleClientAccepted(int clientSocket, const std::string& clientIp, int clientPort) {
+    LOG_INFO("Client connected: " + clientIp + ":" + std::to_string(clientPort));
 
-        /**
-         * @brief 接受客户端连接
-         * 
-         * accept()会阻塞直到有客户端连接到来。
-         * 成功时返回一个新的socket描述符用于与该客户端通信。
-         * 
-         * @note 这里的clientSocket是独立的，与m_serverSocket不同
-         */
-        int clientSocket = accept(m_serverSocket, 
-                                 (struct sockaddr*)&clientAddr, 
-                                 &clientAddrLen);
-        
-        if (clientSocket < 0) {
-            // 被中断信号打断，继续等待
-            if (errno == EINTR) {
-                continue;
-            }
-            perror("accept");
-            break;  // 其他错误，退出循环
+    if (!m_useEpoll) {
+        if (!m_threadPool) {
+            close(clientSocket);
+            return;
         }
 
-        // 获取客户端IP地址和端口
-        char clientIp[INET_ADDRSTRLEN];
-        inet_ntop(AF_INET, &clientAddr.sin_addr, clientIp, sizeof(clientIp));
-        int clientPort = ntohs(clientAddr.sin_port);  // 网络字节序转主机字节序
-
-        std::cout << "Client connected: " << clientIp << ":" << clientPort << std::endl;
-
-        /**
-         * @brief 将客户端处理任务加入线程池
-         * 
-         * 使用lambda表达式捕获this指针和参数，
-         * 将处理任务提交到线程池的工作队列。
-         * 
-         * 线程池会自动分配空闲线程来执行这个任务。
-         */
         m_threadPool->enqueue([this, clientSocket, clientIp, clientPort]() {
             handleClient(clientSocket, clientIp, clientPort);
         });
-    }
-}
-
-/**
- * @brief epoll事件循环
- *
- * 在独立线程中运行，持续调用epoll_wait等待并处理IO事件。
- * 这是epoll模式的核心事件循环。
- */
-void HttpServer::epollEventLoop() {
-    LOG_INFO("Epoll event loop started");
-
-    while (m_running.load() && m_epollManager && m_epollManager->isCreated()) {
-        // 等待事件，超时时间100ms（用于定期检查running状态）
-        int nfds = m_epollManager->waitAndDispatch(100);
-
-        if (nfds < 0) {
-            LOG_ERROR("Epoll wait error");
-            break;
-        }
-
-        // 可以在这里添加额外的处理逻辑，如定时任务等
-    }
-
-    LOG_INFO("Epoll event loop stopped");
-}
-
-/**
- * @brief 处理服务器socket可读事件（epoll模式）
- *
- * 当epoll检测到服务器socket可读时调用，表示有新连接到来。
- * 接受所有可用的新连接（非阻塞模式可能一次有多个）。
- *
- * @param serverSocket 服务器socket描述符
- * @param events epoll事件标志
- */
-void HttpServer::handleServerRead(int serverSocket, uint32_t events) {
-    // 检查错误事件
-    if (events & (EPOLLERR | EPOLLHUP)) {
-        LOG_ERROR("Error on server socket");
         return;
     }
 
-    // 接受所有可用的新连接（非阻塞accept）
-    while (m_running.load()) {
-        struct sockaddr_in clientAddr;
-        socklen_t clientAddrLen = sizeof(clientAddr);
+    if (!m_tcpServer) {
+        close(clientSocket);
+        return;
+    }
 
-        int clientSocket = accept(serverSocket,
-                                 (struct sockaddr*)&clientAddr,
-                                 &clientAddrLen);
+    if (!TcpServer::setNonBlocking(clientSocket)) {
+        LOG_ERROR("Failed to set client socket to non-blocking mode");
+        close(clientSocket);
+        return;
+    }
 
-        if (clientSocket < 0) {
-            // EAGAIN/EWOULDBLOCK表示没有更多连接了
-            if (errno == EAGAIN || errno == EWOULDBLOCK) {
-                break;
-            }
-            // EINTR表示被信号中断，继续尝试
-            if (errno == EINTR) {
-                continue;
-            }
-            perror("accept");
-            break;
-        }
+    struct timeval timeout;
+    timeout.tv_sec = 0;
+    timeout.tv_usec = 100000;
+    setsockopt(clientSocket, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
+    setsockopt(clientSocket, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout));
 
-        // 获取客户端IP地址和端口
-        char clientIp[INET_ADDRSTRLEN];
-        inet_ntop(AF_INET, &clientAddr.sin_addr, clientIp, sizeof(clientIp));
-        int clientPort = ntohs(clientAddr.sin_port);
+    int nodelay = 1;
+    setsockopt(clientSocket, IPPROTO_TCP, TCP_NODELAY, &nodelay, sizeof(nodelay));
 
-        LOG_INFO("Client connected: " + std::string(clientIp) + ":" + std::to_string(clientPort));
+    {
+        std::lock_guard<std::mutex> lock(m_clientInfoMutex);
+        m_clientInfoMap[clientSocket] = {clientIp, clientPort, ""};
+    }
 
-        // 设置客户端socket为非阻塞模式
-        if (!EpollManager::setNonBlocking(clientSocket)) {
-            LOG_ERROR("Failed to set client socket to non-blocking mode");
-            close(clientSocket);
-            continue;
-        }
+    auto clientCallback = [this](int fd, uint32_t ev) {
+        this->handleClientRead(fd, ev);
+    };
 
-        // 设置socket接收超时时间：100ms
-        // ⚠️ Keep-Alive 模式下，线程池线程在阻塞 socket 上 readLine() 等待
-        // 下一个请求的数据，超时必须短，否则 500 连接会耗尽 20 个线程导致饥饿
-        struct timeval timeout;
-        timeout.tv_sec = 0;
-        timeout.tv_usec = 100000;  // 100ms
-        setsockopt(clientSocket, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
-        setsockopt(clientSocket, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout));
-
-        // 启用TCP_NODELAY，禁用Nagle算法，减少小数据包延迟
-        int nodelay = 1;
-        setsockopt(clientSocket, IPPROTO_TCP, TCP_NODELAY, &nodelay, sizeof(nodelay));
-
-        // 保存客户端信息
-        {
-            std::lock_guard<std::mutex> lock(m_clientInfoMutex);
-            m_clientInfoMap[clientSocket] = {std::string(clientIp), clientPort, ""};
-        }
-
-        // 添加客户端socket到epoll监听（水平触发模式，简化处理逻辑）
-        auto clientCallback = [this](int fd, uint32_t ev) {
-            this->handleClientRead(fd, ev);
-        };
-
-        if (!m_epollManager->addFd(clientSocket, EpollEventType::READ, clientCallback, false)) {
-            LOG_ERROR("Failed to add client socket to epoll");
-            close(clientSocket);
-            std::lock_guard<std::mutex> lock(m_clientInfoMutex);
-            m_clientInfoMap.erase(clientSocket);
-            continue;
-        }
+    if (!m_tcpServer->addFd(clientSocket, EpollEventType::READ, clientCallback, false)) {
+        LOG_ERROR("Failed to add client socket to epoll");
+        clearSocketReadBuffer(clientSocket);
+        close(clientSocket);
+        std::lock_guard<std::mutex> lock(m_clientInfoMutex);
+        m_clientInfoMap.erase(clientSocket);
     }
 }
 
@@ -813,7 +931,9 @@ void HttpServer::handleClientRead(int clientSocket, uint32_t events) {
     }
 
     // 从epoll中移除该fd（避免重复触发）
-    m_epollManager->removeFd(clientSocket);
+    if (m_tcpServer) {
+        m_tcpServer->removeFd(clientSocket);
+    }
 
     // 将socket设置为阻塞模式，确保能完整读取HTTP请求
     // 因为此时已经从epoll移除，不再需要非阻塞
@@ -845,7 +965,18 @@ void HttpServer::handleClientRead(int clientSocket, uint32_t events) {
             auto clientCallback = [this](int fd, uint32_t events) {
                 this->handleClientRead(fd, events);
             };
-            this->m_epollManager->addFd(clientSocket, EpollEventType::READ, clientCallback, false);
+            if (this->m_running.load() && this->m_tcpServer &&
+                this->m_tcpServer->addFd(clientSocket, EpollEventType::READ, clientCallback, false)) {
+                std::lock_guard<std::mutex> lock(this->m_clientInfoMutex);
+                this->m_clientInfoMap[clientSocket] = clientInfo;
+            } else {
+                {
+                    std::lock_guard<std::mutex> lock(this->m_clientInfoMutex);
+                    this->m_clientInfoMap.erase(clientSocket);
+                }
+                clearSocketReadBuffer(clientSocket);
+                close(clientSocket);
+            }
         } else {
             // 非Keep-Alive或出错：关闭socket
             clearSocketReadBuffer(clientSocket);
@@ -863,8 +994,8 @@ void HttpServer::handleClientRead(int clientSocket, uint32_t events) {
  */
 void HttpServer::cleanupClient(int clientSocket) {
     // 从epoll中移除
-    if (m_epollManager) {
-        m_epollManager->removeFd(clientSocket);
+    if (m_tcpServer) {
+        m_tcpServer->removeFd(clientSocket);
     }
     // 关闭socket
     clearSocketReadBuffer(clientSocket);
@@ -902,57 +1033,44 @@ bool HttpServer::handleClient(int clientSocket, const std::string& clientIp, int
     HttpResponse response;
     bool parseSuccess = false;
     bool keepAlive = false;
+    size_t declaredResponseSize = 0;
 
     try {
         // 步骤1：解析HTTP请求
         request = parseRequest(clientSocket);
 
         // 检查请求是否有效（如果解析失败，request会是默认构造的无效对象）
-        if (request.getMethod() == HttpRequest::METHOD_UNKNOWN || request.getUrl().empty()) {
-            response = HttpResponse::badRequest();
+        if (request.getUrl().empty()) {
+            response = buildUnifiedErrorResponse(request, HttpResponse::STATUS_400_BAD_REQUEST, "Invalid request");
+            declaredResponseSize = response.getBodySize();
             LOG_WARN("Invalid request from " + clientIp + ":" + std::to_string(clientPort));
+        } else if (request.getMethod() == HttpRequest::METHOD_UNKNOWN) {
+            response = buildUnifiedErrorResponse(request,
+                                                 HttpResponse::STATUS_501_NOT_IMPLEMENTED,
+                                                 "Unsupported HTTP method");
+            declaredResponseSize = response.getBodySize();
+            LOG_WARN("Unsupported HTTP method from " + clientIp + ":" + std::to_string(clientPort));
         } else {
             parseSuccess = true;
-            // 步骤2：根据请求类型调用相应处理函数
-            if (m_requestHandler) {
-                // 使用自定义处理函数
-                response = m_requestHandler(request);
-            } else {
-                // 默认处理
-                if (request.getMethod() == HttpRequest::METHOD_GET) {
-                    // 处理API端点
-                    if (request.getPath() == "/api/echo") {
-                        response = handleApiEcho(request);
-                    } else {
-                        // GET请求提供静态文件服务
-                        response = handleStaticFile(request);
-                    }
-                } else if (request.getMethod() == HttpRequest::METHOD_HEAD) {
-                    // HEAD请求处理：与GET相同，但不返回响应体
-                    if (request.getPath() == "/api/echo") {
-                        response = handleApiEcho(request);
-                    } else {
-                        response = handleStaticFile(request);
-                    }
-                    // HEAD请求不返回响应体，清空body和文件路径
-                    // 注意：保留Content-Type，因为HEAD响应应该包含与GET相同的头部信息
-                    std::string contentType = response.getContentType();
-                    response.setBody("");
-                    response.setFilePath("");
-                    response.setContentType(contentType);
-                } else if (request.getMethod() == HttpRequest::METHOD_POST) {
-                    // POST请求处理
-                    response = handlePostRequest(request);
-                } else {
-                    // 其他HTTP方法返回501 Not Implemented
-                    response = HttpResponse::notImplemented();
-                }
+            runMiddlewareChain(0, request, response, [&]() {
+                processRequest(request, response);
+            });
+            declaredResponseSize = response.getBodySize();
+
+            if (request.getMethod() == HttpRequest::METHOD_HEAD) {
+                stripResponseBodyForHead(response);
             }
         }
     } catch (const std::exception& e) {
         // 捕获异常并返回500错误
         LOG_ERROR("Request handling exception: " + std::string(e.what()));
-        response = HttpResponse::internalServerError();
+        response = buildUnifiedErrorResponse(request,
+                                             HttpResponse::STATUS_500_INTERNAL_SERVER_ERROR,
+                                             e.what());
+        declaredResponseSize = response.getBodySize();
+        if (request.getMethod() == HttpRequest::METHOD_HEAD) {
+            stripResponseBodyForHead(response);
+        }
     }
 
     // 步骤3：判断是否保持连接（Keep-Alive）
@@ -978,7 +1096,7 @@ bool HttpServer::handleClient(int clientSocket, const std::string& clientIp, int
     }
 
     // 步骤4：准备响应体
-    size_t responseSize = 0;
+    size_t responseSize = declaredResponseSize;
     std::string bodyToSend;
     bool useCache = false;
     bool useSendfile = false;  // 是否使用sendfile优化
@@ -1608,49 +1726,22 @@ ssize_t HttpServer::sendData(int socket, const char* data, size_t size) const {
  * @return HttpResponse POST响应对象
  */
 HttpResponse HttpServer::handlePostRequest(const HttpRequest& request) const {
-    HttpResponse response;
-    response.setStatusCode(HttpResponse::STATUS_200_OK);
-    response.addHeader("Content-Type", "application/json; charset=utf-8");
+    const auto formData = request.parseFormData();
+    const auto jsonBody = request.parseJsonBody();
+    nlohmann::json response;
+    response["status"] = "success";
+    response["message"] = "POST request received";
+    response["path"] = request.getPath();
+    response["bodyLength"] = request.getBody().length();
+    response["contentType"] = request.getContentType();
 
-    std::string path = request.getPath();
-    
-    // 处理 /api/echo 端点 - 用于测试POST请求
-    if (path == "/api/echo") {
-        // 构建JSON响应
-        std::ostringstream json;
-        json << "{\n";
-        json << "  \"method\": \"POST\",\n";
-        json << "  \"path\": \"" << path << "\",\n";
-        json << "  \"contentType\": \"" << request.getContentType() << "\",\n";
-        json << "  \"body\": \"" << request.getBody() << "\",\n";
-        
-        // 解析并输出表单数据
-        auto formData = request.parseFormData();
-        json << "  \"formData\": {\n";
-        bool first = true;
-        for (const auto& pair : formData) {
-            if (!first) json << ",\n";
-            json << "    \"" << pair.first << "\": \"" << pair.second << "\"";
-            first = false;
-        }
-        json << "\n  }\n";
-        json << "}";
-        
-        response.setBody(json.str());
-        return response;
+    if (!jsonBody.empty()) {
+        response["jsonBody"] = parsedValueMapToJsonObject(jsonBody);
+    } else {
+        response["formData"] = mapToJsonObject(formData);
     }
-    
-    // 其他POST请求返回简单的确认信息
-    std::ostringstream json;
-    json << "{\n";
-    json << "  \"status\": \"success\",\n";
-    json << "  \"message\": \"POST request received\",\n";
-    json << "  \"path\": \"" << path << "\",\n";
-    json << "  \"bodyLength\": " << request.getBody().length() << "\n";
-    json << "}";
-    
-    response.setBody(json.str());
-    return response;
+
+    return HttpResponse::jsonResponse(HttpResponse::STATUS_200_OK, response.dump(2));
 }
 
 /**
@@ -1663,50 +1754,53 @@ HttpResponse HttpServer::handlePostRequest(const HttpRequest& request) const {
  * @return HttpResponse JSON响应对象
  */
 HttpResponse HttpServer::handleApiEcho(const HttpRequest& request) const {
-    HttpResponse response;
-    response.setStatusCode(HttpResponse::STATUS_200_OK);
-    response.addHeader("Content-Type", "application/json; charset=utf-8");
-
-    std::string path = request.getPath();
-    std::string method = HttpRequest::methodToString(request.getMethod());
-
-    // 构建JSON响应
-    std::ostringstream json;
-    json << "{\n";
-    json << "  \"method\": \"" << method << "\",\n";
-    json << "  \"path\": \"" << path << "\",\n";
-    json << "  \"url\": \"" << request.getUrl() << "\",\n";
-
-    // 解析并输出查询参数
-    auto queryParams = request.parseQueryParams();
-    json << "  \"queryParams\": {\n";
-    bool first = true;
-    for (const auto& pair : queryParams) {
-        if (!first) json << ",\n";
-        json << "    \"" << pair.first << "\": \"" << pair.second << "\"";
-        first = false;
+    nlohmann::json response;
+    response["method"] = HttpRequest::methodToString(request.getMethod());
+    response["path"] = request.getPath();
+    response["url"] = request.getUrl();
+    response["queryParams"] = mapToJsonObject(request.parseQueryParams());
+    if (!request.getPathParams().empty()) {
+        response["pathParams"] = mapToJsonObject(request.getPathParams());
     }
-    json << "\n  }";
 
-    // 如果是POST请求，也输出表单数据
     if (request.getMethod() == HttpRequest::METHOD_POST) {
-        json << ",\n";
-        json << "  \"contentType\": \"" << request.getContentType() << "\",\n";
-        json << "  \"body\": \"" << request.getBody() << "\",\n";
+        response["contentType"] = request.getContentType();
+        response["body"] = request.getBody();
 
-        auto formData = request.parseFormData();
-        json << "  \"formData\": {\n";
-        first = true;
-        for (const auto& pair : formData) {
-            if (!first) json << ",\n";
-            json << "    \"" << pair.first << "\": \"" << pair.second << "\"";
-            first = false;
+        const auto jsonBody = request.parseJsonBody();
+        if (!jsonBody.empty()) {
+            response["jsonBody"] = parsedValueMapToJsonObject(jsonBody);
+        } else {
+            response["formData"] = mapToJsonObject(request.parseFormData());
         }
-        json << "\n  }";
     }
 
-    json << "\n}";
+    return HttpResponse::jsonResponse(HttpResponse::STATUS_200_OK, response.dump(2));
+}
 
-    response.setBody(json.str());
-    return response;
+HttpResponse HttpServer::handleHealthCheck() const {
+    nlohmann::json response;
+    response["status"] = "ok";
+    response["service"] = "CppHttpServer";
+    response["routeCount"] = m_routeHandlers.size();
+    response["patternRouteCount"] = m_routePatterns.size();
+    response["middlewareCount"] = m_middlewares.size();
+
+    return HttpResponse::jsonResponse(HttpResponse::STATUS_200_OK, response.dump(2));
+}
+
+HttpResponse HttpServer::handleStatusRequest() const {
+    nlohmann::json response;
+    response["running"] = m_running.load();
+    response["ip"] = m_ip;
+    response["port"] = m_port;
+    response["docRoot"] = m_docRoot;
+    response["threads"] = m_numThreads;
+    response["cacheEnabled"] = isCacheEnabled();
+    response["cacheStats"] = getCacheStats();
+    response["routes"] = m_routeHandlers.size();
+    response["patternRoutes"] = m_routePatterns.size();
+    response["middlewares"] = m_middlewares.size();
+
+    return HttpResponse::jsonResponse(HttpResponse::STATUS_200_OK, response.dump(2));
 }

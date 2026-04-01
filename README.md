@@ -64,6 +64,41 @@ make -j"$(nproc)"
 build/http_server_cpp
 ```
 
+## Docker 部署
+
+仓库根目录已经提供 `Dockerfile`，可以直接构建镜像并启动容器：
+
+```bash
+docker build -t cpp-http-server .
+docker run -d --name cpp-http-server \
+	-p 8080:8080 \
+	-v cpp_http_logs:/app/build/logs \
+	cpp-http-server
+```
+
+启动后访问：`http://localhost:8080/`
+
+如果需要自定义端口，可以把容器内监听端口和宿主机映射一起改掉：
+
+```bash
+docker run -d --name cpp-http-server \
+	-p 8081:8081 \
+	-v cpp_http_logs:/app/build/logs \
+	cpp-http-server ./http_server_cpp -c ./http_server.conf -p 8081
+```
+
+说明：
+
+- 容器工作目录是 `/app/build`
+- 容器内配置文件默认位于 `/app/build/http_server.conf`
+- 静态资源目录默认位于 `/app/build/html_docs`
+- 日志默认写入 `/app/build/logs/`
+- `-v cpp_http_logs:/app/build/logs` 是推荐方式；如果你想挂载宿主机目录，先确保该目录对容器内 UID 10001 可写
+
+也可以直接使用仓库根目录提供的 `docker-compose.yml` 启动，便于统一端口和日志卷配置：
+
+执行命令：`docker compose up -d`
+
 ## 运行
 
 ### 方式 1：直接运行构建产物（推荐）
@@ -155,7 +190,7 @@ curl -i http://127.0.0.1:8080/index.html
 
 ## 日志
 
-默认日志目录为 `logs/`，常见文件：
+默认日志目录为项目根目录下的 `logs/`，无论从哪里启动，日志都会统一写入这里。常见文件：
 
 - `logs/access.log`
 - `logs/error.log`

@@ -17,13 +17,21 @@
 #include <atomic>          // 原子操作
 #include <unordered_map>   // 哈希映射
 #include <mutex>           // 互斥锁
+#include <vector>          // 动态数组
+#include <cstdint>         // 固定宽度整数
+
+#include <nlohmann/json.hpp>
 
 // 前向声明 - 避免循环依赖
 class ThreadPool;
 class HttpRequest;
 class HttpResponse;
-class EpollManager;  // epoll事件管理器前向声明
+class TcpServer;
 class FileCache;     // 文件缓存前向声明
+
+
+// 请求方法类型需要完整定义
+#include "../request/http_request.h"
 
 // 包含日志系统头文件
 #include "../logger/logger.h"
@@ -63,6 +71,15 @@ public:
      * @return HttpResponse 服务器响应对象
      */
     using RequestHandler = std::function<HttpResponse(const HttpRequest& request)>;
+
+    /**
+     * @brief 中间件函数类型
+     *
+     * 中间件可以在调用 next() 前后处理请求和响应，适合鉴权、日志、CORS 和统一头处理。
+     */
+    using Middleware = std::function<void(const HttpRequest& request,
+                                          HttpResponse& response,
+                                          const std::function<void()>& next)>;
 
     /**
      * @brief 构造函数
@@ -211,9 +228,9 @@ public:
     /**
      * @brief 获取缓存统计信息
      * 
-     * @return std::string 缓存统计信息的JSON格式字符串
+        * @return nlohmann::json 缓存统计信息对象
      */
-    std::string getCacheStats() const;
+        nlohmann::json getCacheStats() const;
 
     /**
      * @brief 清空文件缓存
@@ -243,6 +260,41 @@ public:
     void setRequestHandler(RequestHandler handler);
 
     /**
+     * @brief 添加中间件
+     *
+     * 中间件按注册顺序执行。
+     *
+     * @param middleware 中间件函数
+     */
+    void addMiddleware(Middleware middleware);
+
+    /**
+     * @brief 清空所有中间件
+     */
+    void clearMiddlewares();
+
+    /**
+     * @brief 注册支持路径参数的路由
+     *
+     * 路由模式支持 {name} 形式的段参数，例如 /users/{id}。
+     *
+     * @param method HTTP方法
+     * @param pathPattern 路由模式
+     * @param handler 处理函数
+     */
+    void registerRoutePattern(HttpRequest::Method method, const std::string& pathPattern, RequestHandler handler);
+
+    /**
+     * @brief 处理一个已经解析好的请求
+     *
+     * 该接口会经过中间件、路由、静态文件和统一错误处理链路，适合测试和嵌入式调用。
+     *
+     * @param request HTTP请求对象
+     * @return HttpResponse 响应对象
+     */
+    HttpResponse handleRequest(HttpRequest request) const;
+
+    /**
      * @brief 获取本地IP地址
      * 
      * 获取服务器绑定的实际IP地址。
@@ -252,35 +304,13 @@ public:
     std::string getLocalIp() const;
 
 private:
-    /**
-     * @brief 接受客户端连接（传统线程池模式）
-     *
-     * 在独立线程中运行，持续接受新的客户端连接。
-     * 每个新连接会被加入到线程池的任务队列中。
-     *
-     * @note 此方法在start()中启动的独立线程中运行
-     * @note 当useEpoll_为true时，此方法不使用
-     */
-    void acceptConnections();
+    using RouteTable = std::unordered_map<std::string, RequestHandler>;
 
-    /**
-     * @brief 使用epoll接受客户端连接
-     *
-     * 在独立线程中运行，使用epoll_wait等待连接事件。
-     * 新连接被添加到epoll监听集合中。
-     *
-     * @note 此方法在start()中启动的独立线程中运行（epoll模式）
-     */
-    void acceptConnectionsEpoll();
-
-    /**
-     * @brief 处理epoll事件循环
-     *
-     * 在独立线程中运行，调用epoll_wait等待并处理IO事件。
-     *
-     * @note 此方法在start()中启动的独立线程中运行（epoll模式）
-     */
-    void epollEventLoop();
+    struct RoutePattern {
+        HttpRequest::Method method;
+        std::string pattern;
+        RequestHandler handler;
+    };
 
     /**
      * @brief 处理客户端可读事件（epoll模式）
@@ -294,14 +324,15 @@ private:
     void handleClientRead(int clientSocket, uint32_t events);
 
     /**
-     * @brief 处理服务器socket可读事件（epoll模式）
+      * @brief 处理已接受的客户端连接
      *
-     * 当epoll检测到服务器socket可读时调用（有新连接到来）。
+      * 当TCP层接受到新连接时调用。
      *
-     * @param serverSocket 服务器socket描述符
-     * @param events epoll事件标志
+      * @param clientSocket 客户端socket描述符
+      * @param clientIp 客户端IP地址
+      * @param clientPort 客户端端口号
      */
-    void handleServerRead(int serverSocket, uint32_t events);
+     void handleClientAccepted(int clientSocket, const std::string& clientIp, int clientPort);
 
     /**
      * @brief 清理客户端连接资源
@@ -311,6 +342,59 @@ private:
      * @param clientSocket 客户端socket描述符
      */
     void cleanupClient(int clientSocket);
+
+    /**
+     * @brief 注册默认路由
+     */
+    void registerDefaultRoutes();
+
+    /**
+     * @brief 注册单个路由
+     */
+    void registerRoute(HttpRequest::Method method, const std::string& path, RequestHandler handler);
+
+    /**
+     * @brief 执行请求处理中间件链
+     */
+    void runMiddlewareChain(size_t index,
+                            const HttpRequest& request,
+                            HttpResponse& response,
+                            const std::function<void()>& finalHandler) const;
+
+    /**
+     * @brief 构造路由键
+     */
+    std::string buildRouteKey(HttpRequest::Method method, const std::string& path) const;
+
+    /**
+     * @brief 获取指定路径允许的方法列表
+     */
+    std::string getAllowedMethodsForPath(const std::string& path) const;
+
+    /**
+     * @brief 分发到显式路由
+     */
+    bool dispatchRoute(const HttpRequest& request, HttpResponse& response) const;
+
+    /**
+     * @brief 处理请求核心逻辑（不包含中间件和连接状态）
+     */
+    void processRequest(HttpRequest& request, HttpResponse& response) const;
+
+    /**
+     * @brief 生成统一错误响应
+     */
+    HttpResponse buildUnifiedErrorResponse(const HttpRequest& request,
+                                           int code,
+                                           const std::string& detail = "",
+                                           const std::string& allowMethods = "") const;
+
+    /**
+     * @brief 判断路径模式是否匹配
+     */
+    bool matchRoutePattern(const std::string& pattern,
+                           const std::string& path,
+                           std::map<std::string, std::string>& pathParams) const;
 
     /**
      * @brief 处理客户端请求
@@ -375,6 +459,16 @@ private:
      * @return HttpResponse JSON响应对象
      */
     HttpResponse handleApiEcho(const HttpRequest& request) const;
+
+    /**
+     * @brief 处理健康检查路由
+     */
+    HttpResponse handleHealthCheck() const;
+
+    /**
+     * @brief 处理状态路由
+     */
+    HttpResponse handleStatusRequest() const;
 
     /**
      * @brief URL解码
@@ -456,31 +550,34 @@ private:
     /** 线程池工作线程数量 */
     int m_numThreads;
 
-    /** 服务器监听socket描述符 */
-    int m_serverSocket;
-
     /** 服务器运行状态标志（原子操作保证线程安全） */
     std::atomic<bool> m_running;
+
+    /** TCP传输层封装 */
+    std::unique_ptr<TcpServer> m_tcpServer;
 
     /** 线程池智能指针 */
     std::unique_ptr<ThreadPool> m_threadPool;
 
-    /** 接受客户端连接的线程 */
-    std::thread m_acceptThread;
-
     /** 自定义请求处理函数 */
     RequestHandler m_requestHandler;
+
+    /** 显式路由表 */
+    RouteTable m_routeHandlers;
+
+    /** 路径模式路由表 */
+    std::vector<RoutePattern> m_routePatterns;
+
+    /** 中间件链 */
+    std::vector<Middleware> m_middlewares;
+
+    /** 请求计数器，用于生成请求ID */
+    std::atomic<uint64_t> m_requestCounter;
 
     //================== epoll相关成员变量 ==================
 
     /** 是否使用epoll模式 */
     bool m_useEpoll;
-
-    /** epoll事件管理器 */
-    std::unique_ptr<EpollManager> m_epollManager;
-
-    /** epoll事件处理线程 */
-    std::thread m_epollThread;
 
     /** 客户端信息结构体（用于epoll模式） */
     struct ClientInfo {

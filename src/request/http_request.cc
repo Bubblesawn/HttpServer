@@ -10,6 +10,71 @@
 
 #include <algorithm>     
 #include <cstring>       // C字符串处理
+#include <cctype>
+
+#include <nlohmann/json.hpp>
+
+namespace {
+
+/**
+ * @brief 生成字符串的小写副本
+ *
+ * 该函数不会修改原始输入，常用于对HTTP头部值做大小写不敏感比较。
+ *
+ * @param input 原始字符串
+ * @return std::string 转换为小写后的副本
+ */
+std::string toLowerCopy(const std::string& input) {
+    std::string output = input;
+    std::transform(output.begin(), output.end(), output.begin(), [](unsigned char ch) {
+        return static_cast<char>(std::tolower(ch));
+    });
+    return output;
+}
+
+/**
+ * @brief 解析URL编码的键值对字符串
+ *
+ * 支持 application/x-www-form-urlencoded 常见格式：
+ * key1=value1&key2=value2
+ *
+ * @param encoded 已URL编码的查询串或表单串
+ * @return std::map<std::string, std::string> 解析得到的键值对
+ */
+std::map<std::string, std::string> parseUrlEncodedPairs(const std::string& encoded) {
+    std::map<std::string, std::string> params;
+
+    size_t start = 0;
+    while (start < encoded.length()) {
+        size_t ampPos = encoded.find('&', start);
+        std::string pair;
+
+        if (ampPos == std::string::npos) {
+            pair = encoded.substr(start);
+            start = encoded.length();
+        } else {
+            pair = encoded.substr(start, ampPos - start);
+            start = ampPos + 1;
+        }
+
+        if (pair.empty()) {
+            continue;
+        }
+
+        size_t eqPos = pair.find('=');
+        if (eqPos != std::string::npos) {
+            std::string key = HttpRequest::urlDecode(pair.substr(0, eqPos));
+            std::string value = HttpRequest::urlDecode(pair.substr(eqPos + 1));
+            params[key] = value;
+        } else {
+            params[HttpRequest::urlDecode(pair)] = "";
+        }
+    }
+
+    return params;
+}
+
+} // namespace
 
 /**
  * @brief 构造函数
@@ -75,6 +140,7 @@ HttpRequest::Method HttpRequest::getMethod() const {
  */
 void HttpRequest::setUrl(const std::string& url) {
     m_url = url;
+    m_pathParams.clear();
     
     // 查找查询字符串起始位置（?）
     size_t pos = url.find('?');
@@ -103,6 +169,7 @@ std::string HttpRequest::getUrl() const {
  */
 void HttpRequest::setPath(const std::string& path) {
     m_path = path;
+    m_pathParams.clear();
 }
 
 /**
@@ -207,7 +274,7 @@ int HttpRequest::getClientPort() const {
 /**
  * @brief 清空请求
  *
- * 重置所有成员变量到初始状态。
+ * 重置所有成员变量到初始状态，适用于对象复用和连接池场景。
  */
 void HttpRequest::clear() {
     m_method = METHOD_UNKNOWN;
@@ -215,6 +282,7 @@ void HttpRequest::clear() {
     m_path.clear();
     m_headers.clear();
     m_body.clear();
+    m_pathParams.clear();
     m_clientIp.clear();
     m_clientPort = 0;
     m_version.clear();
@@ -242,6 +310,7 @@ std::string HttpRequest::getVersion() const {
  * @brief 将字符串转换为HTTP方法枚举
  * 
  * 静态方法，支持不区分大小写的比较。
+ * 未识别的方法会返回 METHOD_UNKNOWN，便于上层统一走错误响应分支。
  * 
  * @param method HTTP方法名字符串
  * @return Method 对应的枚举值
@@ -249,6 +318,7 @@ std::string HttpRequest::getVersion() const {
 HttpRequest::Method HttpRequest::stringToMethod(const std::string& method) {
     // 使用strcasecmp进行不区分大小写的比较
     if (strcasecmp(method.c_str(), "GET") == 0) return METHOD_GET;
+    if (strcasecmp(method.c_str(), "OPTIONS") == 0) return METHOD_OPTIONS;
     if (strcasecmp(method.c_str(), "POST") == 0) return METHOD_POST;
     if (strcasecmp(method.c_str(), "PUT") == 0) return METHOD_PUT;
     if (strcasecmp(method.c_str(), "DELETE") == 0) return METHOD_DELETE;
@@ -260,6 +330,7 @@ HttpRequest::Method HttpRequest::stringToMethod(const std::string& method) {
  * @brief 将HTTP方法枚举转换为字符串
  * 
  * 静态方法，将枚举值转换为可读的方法名字符串。
+ * 该函数主要用于日志输出、响应调试和协议信息回显。
  * 
  * @param method HTTP方法枚举值
  * @return std::string 方法名字符串
@@ -267,6 +338,7 @@ HttpRequest::Method HttpRequest::stringToMethod(const std::string& method) {
 std::string HttpRequest::methodToString(Method method) {
     switch (method) {
         case METHOD_GET:    return "GET";
+        case METHOD_OPTIONS:return "OPTIONS";
         case METHOD_POST:   return "POST";
         case METHOD_PUT:    return "PUT";
         case METHOD_DELETE: return "DELETE";
@@ -279,7 +351,8 @@ std::string HttpRequest::methodToString(Method method) {
  * @brief URL解码函数
  * 
  * 将URL编码的字符串解码为原始字符串。
- * 支持 %XX 格式的编码（如 %20 转换为空格）。
+ * 支持 %XX 格式的编码（如 %20 转换为空格）以及 + 到空格的转换。
+ * 对非法十六进制片段保持宽松处理，不会抛出异常。
  * 
  * @param encoded URL编码的字符串
  * @return std::string 解码后的字符串
@@ -322,49 +395,39 @@ std::string HttpRequest::urlDecode(const std::string& encoded) {
  * 
  * 从URL的查询字符串中解析出键值对参数。
  * 格式: ?key1=value1&key2=value2
+ * 若URL中不存在查询串，则返回空集合。
  * 
  * @return std::map<std::string, std::string> 参数键值对
  */
 std::map<std::string, std::string> HttpRequest::parseQueryParams() const {
-    std::map<std::string, std::string> params;
-    
     // 查找查询字符串起始位置
     size_t queryPos = m_url.find('?');
     if (queryPos == std::string::npos) {
-        return params;  // 没有查询字符串
+        return {};  // 没有查询字符串
     }
     
     // 提取查询字符串部分（去掉?）
     std::string queryString = m_url.substr(queryPos + 1);
-    
-    // 解析键值对
-    size_t start = 0;
-    while (start < queryString.length()) {
-        // 查找 & 分隔符
-        size_t ampPos = queryString.find('&', start);
-        std::string pair;
-        
-        if (ampPos == std::string::npos) {
-            pair = queryString.substr(start);
-            start = queryString.length();
-        } else {
-            pair = queryString.substr(start, ampPos - start);
-            start = ampPos + 1;
-        }
-        
-        // 解析 key=value
-        size_t eqPos = pair.find('=');
-        if (eqPos != std::string::npos) {
-            std::string key = urlDecode(pair.substr(0, eqPos));
-            std::string value = urlDecode(pair.substr(eqPos + 1));
-            params[key] = value;
-        } else if (!pair.empty()) {
-            // 只有key没有value的情况
-            params[urlDecode(pair)] = "";
-        }
+
+    return parseUrlEncodedPairs(queryString);
+}
+
+/**
+ * @brief 解析请求体中的表单数据
+ * 
+ * 根据Content-Type解析请求体中的表单数据。
+ * 支持 application/x-www-form-urlencoded 格式。
+ * 如果Content-Type不匹配，则返回空集合。
+ * 
+ * @return std::map<std::string, std::string> 表单数据键值对
+ */
+std::map<std::string, std::string> HttpRequest::parseBodyParams() const {
+    std::string contentType = toLowerCopy(getContentType());
+    if (contentType.find("application/x-www-form-urlencoded") == std::string::npos) {
+        return {};
     }
-    
-    return params;
+
+    return parseUrlEncodedPairs(m_body);
 }
 
 /**
@@ -372,51 +435,121 @@ std::map<std::string, std::string> HttpRequest::parseQueryParams() const {
  * 
  * 根据Content-Type解析请求体中的表单数据。
  * 支持 application/x-www-form-urlencoded 格式。
+ * 该接口是 parseBodyParams 的语义别名，便于上层按请求类型阅读代码。
  * 
  * @return std::map<std::string, std::string> 表单数据键值对
  */
 std::map<std::string, std::string> HttpRequest::parseFormData() const {
-    std::map<std::string, std::string> formData;
-    
-    // 检查Content-Type是否为表单类型
-    std::string contentType = getContentType();
-    if (contentType.find("application/x-www-form-urlencoded") == std::string::npos) {
-        return formData;  // 不是URL编码的表单数据
+    return parseBodyParams();
+}
+
+/**
+ * @brief 解析JSON请求体
+ * 
+ * 仅支持顶层JSON对象。
+ * 当Content-Type不是JSON相关类型时返回空集合。
+ * 
+ * @return std::map<std::string, std::string> JSON字段键值对
+ */
+std::map<std::string, std::string> HttpRequest::parseJsonBody() const {
+    std::string contentType = toLowerCopy(getContentType());
+    if (contentType.find("application/json") == std::string::npos &&
+        contentType.find("+json") == std::string::npos) {
+        return {};
     }
-    
-    // 请求体格式与查询字符串相同: key1=value1&key2=value2
-    size_t start = 0;
-    while (start < m_body.length()) {
-        // 查找 & 分隔符
-        size_t ampPos = m_body.find('&', start);
-        std::string pair;
-        
-        if (ampPos == std::string::npos) {
-            pair = m_body.substr(start);
-            start = m_body.length();
+
+    const auto parsed = nlohmann::json::parse(m_body, nullptr, false);
+    if (parsed.is_discarded() || !parsed.is_object()) {
+        return {};
+    }
+
+    std::map<std::string, std::string> values;
+    for (const auto& item : parsed.items()) {
+        if (item.value().is_string()) {
+            values[item.key()] = item.value().get<std::string>();
         } else {
-            pair = m_body.substr(start, ampPos - start);
-            start = ampPos + 1;
-        }
-        
-        // 解析 key=value
-        size_t eqPos = pair.find('=');
-        if (eqPos != std::string::npos) {
-            std::string key = urlDecode(pair.substr(0, eqPos));
-            std::string value = urlDecode(pair.substr(eqPos + 1));
-            formData[key] = value;
-        } else if (!pair.empty()) {
-            // 只有key没有value的情况
-            formData[urlDecode(pair)] = "";
+            values[item.key()] = item.value().dump();
         }
     }
-    
-    return formData;
+
+    return values;
+}
+
+/**
+ * @brief 设置路径参数
+ *
+ * @param pathParams 路径参数键值对
+ */
+void HttpRequest::setPathParams(const std::map<std::string, std::string>& pathParams) {
+    m_pathParams = pathParams;
+}
+
+/**
+ * @brief 获取所有路径参数
+ *
+ * @return std::map<std::string, std::string> 路径参数键值对
+ */
+std::map<std::string, std::string> HttpRequest::getPathParams() const {
+    return m_pathParams;
+}
+
+/**
+ * @brief 获取指定路径参数
+ *
+ * @param key 参数名
+ * @return std::string 参数值
+ */
+std::string HttpRequest::getPathParam(const std::string& key) const {
+    auto it = m_pathParams.find(key);
+    if (it != m_pathParams.end()) {
+        return it->second;
+    }
+    return "";
+}
+
+/**
+ * @brief 清空路径参数
+ */
+void HttpRequest::clearPathParams() {
+    m_pathParams.clear();
+}
+
+/**
+ * @brief 获取统一参数值
+ * 
+ * 依次从查询参数、表单参数和JSON请求体中查找指定键。
+ * 查找顺序固定，前面的来源具有更高优先级，适合统一参数读取入口。
+ * 
+ * @param key 参数名
+ * @return std::string 参数值，不存在则返回空字符串
+ */
+std::string HttpRequest::getParameter(const std::string& key) const {
+    const auto queryParams = parseQueryParams();
+    const auto queryIt = queryParams.find(key);
+    if (queryIt != queryParams.end()) {
+        return queryIt->second;
+    }
+
+    const auto formParams = parseBodyParams();
+    const auto formIt = formParams.find(key);
+    if (formIt != formParams.end()) {
+        return formIt->second;
+    }
+
+    const auto jsonParams = parseJsonBody();
+    const auto jsonIt = jsonParams.find(key);
+    if (jsonIt != jsonParams.end()) {
+        return jsonIt->second;
+    }
+
+    return "";
 }
 
 /**
  * @brief 获取Content-Type头部值
  * 
+ * 这是对请求头的便捷访问封装，便于表单和JSON解析逻辑复用。
+ *
  * @return std::string Content-Type值，如果不存在返回空字符串
  */
 std::string HttpRequest::getContentType() const {

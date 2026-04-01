@@ -155,6 +155,16 @@ void Logger::setMinLevel(LogLevel level) {
 }
 
 /**
+ * @brief 设置是否输出到控制台
+ *
+ * @param enabled true输出，false关闭
+ */
+void Logger::setConsoleOutput(bool enabled) {
+    std::lock_guard<std::mutex> lock(m_mutex);
+    m_consoleOutput = enabled;
+}
+
+/**
  * @brief 记录DEBUG级别日志
  *
  * @param message 日志消息

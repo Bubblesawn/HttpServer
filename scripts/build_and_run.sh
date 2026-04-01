@@ -7,8 +7,9 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 BUILD_DIR="$PROJECT_ROOT/build"
 DEFAULT_CONFIG="$PROJECT_ROOT/http_server.conf"
-PID_FILE="$PROJECT_ROOT/logs/http_server.pid"
-OUT_LOG="$PROJECT_ROOT/logs/server.out.log"
+LOG_DIR="$PROJECT_ROOT/build/logs"
+PID_FILE="$LOG_DIR/http_server.pid"
+OUT_LOG="$LOG_DIR/server.out.log"
 
 CONFIG_FILE="$DEFAULT_CONFIG"
 CLEAN_BUILD=0
@@ -76,7 +77,7 @@ fi
 echo ""
 echo "[2/3] 编译项目..."
 mkdir -p "$BUILD_DIR"
-mkdir -p "$PROJECT_ROOT/logs"
+mkdir -p "$LOG_DIR"
 cd "$BUILD_DIR"
 cmake ..
 make -j"$(nproc)"
