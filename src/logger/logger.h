@@ -80,6 +80,13 @@ public:
     void setMinLevel(LogLevel level);
 
     /**
+     * @brief 设置是否输出到控制台
+     *
+     * @param enabled true输出，false关闭
+     */
+    void setConsoleOutput(bool enabled);
+
+    /**
      * @brief 记录DEBUG级别日志
      *
      * @param message 日志消息

@@ -5,6 +5,7 @@
 
 #include "request/http_request.h"
 #include "response/http_response.h"
+#include "server/http_server.h"
 
 namespace {
 
@@ -46,6 +47,9 @@ void testHttpRequestParsing() {
     request.setClientPort(12345);
 
     expectTrue(request.getMethod() == HttpRequest::METHOD_GET, "method string should map to GET");
+    request.setMethodString("options");
+    expectTrue(request.getMethod() == HttpRequest::METHOD_OPTIONS, "method string should map to OPTIONS");
+    request.setMethodString("get");
     expectEqual(request.getUrl(), "/search?q=hello+world&lang=zh-cn", "url should be stored as-is");
     expectEqual(request.getPath(), "/search", "path should drop query string");
     expectEqual(request.getContentType(), "application/x-www-form-urlencoded; charset=utf-8", "content type should be retrievable");
@@ -173,6 +177,54 @@ void testHttpResponseErrorFactories() {
                "501 response should serialize default close connection");
 }
 
+void testHttpServerRoutePatterns() {
+    HttpServer server;
+    server.registerRoutePattern(HttpRequest::METHOD_GET, "/users/{id}", [](const HttpRequest& request) {
+        HttpResponse response;
+        response.setStatusCode(HttpResponse::STATUS_200_OK);
+        response.setContentType("text/plain; charset=utf-8");
+        response.setBody(request.getPathParam("id"));
+        return response;
+    });
+
+    HttpRequest request;
+    request.setMethodString("GET");
+    request.setUrl("/users/42");
+    request.setVersion("HTTP/1.1");
+
+    const HttpResponse response = server.handleRequest(request);
+    expectTrue(response.getStatusCode() == HttpResponse::STATUS_200_OK, "pattern route should return 200");
+    expectEqual(response.getBody(), "42", "pattern route should expose path parameter");
+    expectTrue(!response.getHeader("X-Request-Id").empty(), "middleware should attach request id");
+    expectTrue(response.getHeader("X-Content-Type-Options") == "nosniff", "middleware should attach security header");
+}
+
+void testHttpServerOptionsAndAllowHeader() {
+    HttpServer server;
+
+    HttpRequest optionsRequest;
+    optionsRequest.setMethodString("OPTIONS");
+    optionsRequest.setUrl("/health");
+    optionsRequest.setVersion("HTTP/1.1");
+
+    const HttpResponse optionsResponse = server.handleRequest(optionsRequest);
+    expectTrue(optionsResponse.getStatusCode() == HttpResponse::STATUS_204_NO_CONTENT,
+               "OPTIONS should return no-content response");
+    expectTrue(optionsResponse.getHeader("Allow").find("OPTIONS") != std::string::npos,
+               "OPTIONS response should advertise OPTIONS support");
+
+    HttpRequest putRequest;
+    putRequest.setMethodString("PUT");
+    putRequest.setUrl("/health");
+    putRequest.setVersion("HTTP/1.1");
+
+    const HttpResponse putResponse = server.handleRequest(putRequest);
+    expectTrue(putResponse.getStatusCode() == HttpResponse::STATUS_405_METHOD_NOT_ALLOWED,
+               "unsupported method should return 405");
+    expectTrue(putResponse.getHeader("Allow").find("OPTIONS") != std::string::npos,
+               "Allow header should include OPTIONS");
+}
+
 }  // namespace
 
 int main() {
@@ -183,6 +235,8 @@ int main() {
     testHttpResponseStandardizedHelpers();
     testHttpResponseFileBodySize();
     testHttpResponseErrorFactories();
+    testHttpServerRoutePatterns();
+    testHttpServerOptionsAndAllowHeader();
 
     if (g_failed != 0) {
         std::cerr << "[RESULT] " << g_failed << "/" << g_run << " checks failed" << std::endl;

@@ -140,6 +140,7 @@ HttpRequest::Method HttpRequest::getMethod() const {
  */
 void HttpRequest::setUrl(const std::string& url) {
     m_url = url;
+    m_pathParams.clear();
     
     // 查找查询字符串起始位置（?）
     size_t pos = url.find('?');
@@ -168,6 +169,7 @@ std::string HttpRequest::getUrl() const {
  */
 void HttpRequest::setPath(const std::string& path) {
     m_path = path;
+    m_pathParams.clear();
 }
 
 /**
@@ -280,6 +282,7 @@ void HttpRequest::clear() {
     m_path.clear();
     m_headers.clear();
     m_body.clear();
+    m_pathParams.clear();
     m_clientIp.clear();
     m_clientPort = 0;
     m_version.clear();
@@ -315,6 +318,7 @@ std::string HttpRequest::getVersion() const {
 HttpRequest::Method HttpRequest::stringToMethod(const std::string& method) {
     // 使用strcasecmp进行不区分大小写的比较
     if (strcasecmp(method.c_str(), "GET") == 0) return METHOD_GET;
+    if (strcasecmp(method.c_str(), "OPTIONS") == 0) return METHOD_OPTIONS;
     if (strcasecmp(method.c_str(), "POST") == 0) return METHOD_POST;
     if (strcasecmp(method.c_str(), "PUT") == 0) return METHOD_PUT;
     if (strcasecmp(method.c_str(), "DELETE") == 0) return METHOD_DELETE;
@@ -334,6 +338,7 @@ HttpRequest::Method HttpRequest::stringToMethod(const std::string& method) {
 std::string HttpRequest::methodToString(Method method) {
     switch (method) {
         case METHOD_GET:    return "GET";
+        case METHOD_OPTIONS:return "OPTIONS";
         case METHOD_POST:   return "POST";
         case METHOD_PUT:    return "PUT";
         case METHOD_DELETE: return "DELETE";
@@ -468,6 +473,45 @@ std::map<std::string, std::string> HttpRequest::parseJsonBody() const {
     }
 
     return values;
+}
+
+/**
+ * @brief 设置路径参数
+ *
+ * @param pathParams 路径参数键值对
+ */
+void HttpRequest::setPathParams(const std::map<std::string, std::string>& pathParams) {
+    m_pathParams = pathParams;
+}
+
+/**
+ * @brief 获取所有路径参数
+ *
+ * @return std::map<std::string, std::string> 路径参数键值对
+ */
+std::map<std::string, std::string> HttpRequest::getPathParams() const {
+    return m_pathParams;
+}
+
+/**
+ * @brief 获取指定路径参数
+ *
+ * @param key 参数名
+ * @return std::string 参数值
+ */
+std::string HttpRequest::getPathParam(const std::string& key) const {
+    auto it = m_pathParams.find(key);
+    if (it != m_pathParams.end()) {
+        return it->second;
+    }
+    return "";
+}
+
+/**
+ * @brief 清空路径参数
+ */
+void HttpRequest::clearPathParams() {
+    m_pathParams.clear();
 }
 
 /**

@@ -17,6 +17,8 @@
 #include <atomic>          // 原子操作
 #include <unordered_map>   // 哈希映射
 #include <mutex>           // 互斥锁
+#include <vector>          // 动态数组
+#include <cstdint>         // 固定宽度整数
 
 #include <nlohmann/json.hpp>
 
@@ -69,6 +71,15 @@ public:
      * @return HttpResponse 服务器响应对象
      */
     using RequestHandler = std::function<HttpResponse(const HttpRequest& request)>;
+
+    /**
+     * @brief 中间件函数类型
+     *
+     * 中间件可以在调用 next() 前后处理请求和响应，适合鉴权、日志、CORS 和统一头处理。
+     */
+    using Middleware = std::function<void(const HttpRequest& request,
+                                          HttpResponse& response,
+                                          const std::function<void()>& next)>;
 
     /**
      * @brief 构造函数
@@ -249,6 +260,41 @@ public:
     void setRequestHandler(RequestHandler handler);
 
     /**
+     * @brief 添加中间件
+     *
+     * 中间件按注册顺序执行。
+     *
+     * @param middleware 中间件函数
+     */
+    void addMiddleware(Middleware middleware);
+
+    /**
+     * @brief 清空所有中间件
+     */
+    void clearMiddlewares();
+
+    /**
+     * @brief 注册支持路径参数的路由
+     *
+     * 路由模式支持 {name} 形式的段参数，例如 /users/{id}。
+     *
+     * @param method HTTP方法
+     * @param pathPattern 路由模式
+     * @param handler 处理函数
+     */
+    void registerRoutePattern(HttpRequest::Method method, const std::string& pathPattern, RequestHandler handler);
+
+    /**
+     * @brief 处理一个已经解析好的请求
+     *
+     * 该接口会经过中间件、路由、静态文件和统一错误处理链路，适合测试和嵌入式调用。
+     *
+     * @param request HTTP请求对象
+     * @return HttpResponse 响应对象
+     */
+    HttpResponse handleRequest(HttpRequest request) const;
+
+    /**
      * @brief 获取本地IP地址
      * 
      * 获取服务器绑定的实际IP地址。
@@ -259,6 +305,12 @@ public:
 
 private:
     using RouteTable = std::unordered_map<std::string, RequestHandler>;
+
+    struct RoutePattern {
+        HttpRequest::Method method;
+        std::string pattern;
+        RequestHandler handler;
+    };
 
     /**
      * @brief 处理客户端可读事件（epoll模式）
@@ -302,6 +354,14 @@ private:
     void registerRoute(HttpRequest::Method method, const std::string& path, RequestHandler handler);
 
     /**
+     * @brief 执行请求处理中间件链
+     */
+    void runMiddlewareChain(size_t index,
+                            const HttpRequest& request,
+                            HttpResponse& response,
+                            const std::function<void()>& finalHandler) const;
+
+    /**
      * @brief 构造路由键
      */
     std::string buildRouteKey(HttpRequest::Method method, const std::string& path) const;
@@ -315,6 +375,26 @@ private:
      * @brief 分发到显式路由
      */
     bool dispatchRoute(const HttpRequest& request, HttpResponse& response) const;
+
+    /**
+     * @brief 处理请求核心逻辑（不包含中间件和连接状态）
+     */
+    void processRequest(HttpRequest& request, HttpResponse& response) const;
+
+    /**
+     * @brief 生成统一错误响应
+     */
+    HttpResponse buildUnifiedErrorResponse(const HttpRequest& request,
+                                           int code,
+                                           const std::string& detail = "",
+                                           const std::string& allowMethods = "") const;
+
+    /**
+     * @brief 判断路径模式是否匹配
+     */
+    bool matchRoutePattern(const std::string& pattern,
+                           const std::string& path,
+                           std::map<std::string, std::string>& pathParams) const;
 
     /**
      * @brief 处理客户端请求
@@ -484,6 +564,15 @@ private:
 
     /** 显式路由表 */
     RouteTable m_routeHandlers;
+
+    /** 路径模式路由表 */
+    std::vector<RoutePattern> m_routePatterns;
+
+    /** 中间件链 */
+    std::vector<Middleware> m_middlewares;
+
+    /** 请求计数器，用于生成请求ID */
+    std::atomic<uint64_t> m_requestCounter;
 
     //================== epoll相关成员变量 ==================
 

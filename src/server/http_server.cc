@@ -48,6 +48,53 @@ namespace {
 std::mutex g_readBufferMutex;
 std::unordered_map<int, std::string> g_socketReadBuffers;
 
+std::string toLowerCopy(const std::string& input) {
+    std::string output = input;
+    std::transform(output.begin(), output.end(), output.begin(), [](unsigned char ch) {
+        return static_cast<char>(std::tolower(ch));
+    });
+    return output;
+}
+
+std::vector<std::string> splitPathSegments(const std::string& path) {
+    std::vector<std::string> segments;
+    size_t start = 0;
+
+    while (start < path.length()) {
+        while (start < path.length() && path[start] == '/') {
+            ++start;
+        }
+
+        size_t end = start;
+        while (end < path.length() && path[end] != '/') {
+            ++end;
+        }
+
+        if (end > start) {
+            segments.emplace_back(path.substr(start, end - start));
+        }
+
+        start = end + 1;
+    }
+
+    return segments;
+}
+
+bool containsJsonAcceptHeader(const HttpRequest& request) {
+    const std::string accept = toLowerCopy(request.getHeader("Accept"));
+    if (accept.find("application/json") != std::string::npos) {
+        return true;
+    }
+
+    const std::string contentType = toLowerCopy(request.getContentType());
+    if (contentType.find("application/json") != std::string::npos ||
+        contentType.find("+json") != std::string::npos) {
+        return true;
+    }
+
+    return request.getPath().rfind("/api/", 0) == 0;
+}
+
 nlohmann::json valueToJson(const std::string& value) {
     const auto parsed = nlohmann::json::parse(value, nullptr, false);
     if (!parsed.is_discarded()) {
@@ -204,6 +251,7 @@ HttpServer::HttpServer(const std::string& ip, int port)
     , m_numThreads(std::thread::hardware_concurrency() * 2)  // 默认线程数为CPU核心数的2倍，提高并发处理能力
     , m_running(false)            // 初始状态为未运行
     , m_tcpServer(nullptr)
+    , m_requestCounter(0)        // 请求ID计数器初始化为0
     , m_useEpoll(true)           // 默认启用epoll模式
     , m_fileCache(nullptr) {     // 文件缓存初始化为nullptr
     /**
@@ -217,6 +265,16 @@ HttpServer::HttpServer(const std::string& ip, int port)
     signal(SIGPIPE, SIG_IGN);
 
     registerDefaultRoutes();
+
+    addMiddleware([this](const HttpRequest& request, HttpResponse& response, const std::function<void()>& next) {
+        const uint64_t requestId = m_requestCounter.fetch_add(1, std::memory_order_relaxed) + 1;
+        response.addHeader("X-Request-Id", std::to_string(requestId));
+        next();
+        response.addHeader("X-Content-Type-Options", "nosniff");
+        if (request.getMethod() == HttpRequest::METHOD_OPTIONS) {
+            response.addHeader("Access-Control-Allow-Origin", "*");
+        }
+    });
 }
 
 /**
@@ -486,8 +544,46 @@ void HttpServer::clearCache() {
     }
 }
 
+void HttpServer::addMiddleware(Middleware middleware) {
+    if (middleware) {
+        m_middlewares.push_back(std::move(middleware));
+    }
+}
+
+void HttpServer::clearMiddlewares() {
+    m_middlewares.clear();
+}
+
 std::string HttpServer::buildRouteKey(HttpRequest::Method method, const std::string& path) const {
     return HttpRequest::methodToString(method) + " " + path;
+}
+
+bool HttpServer::matchRoutePattern(const std::string& pattern,
+                                   const std::string& path,
+                                   std::map<std::string, std::string>& pathParams) const {
+    const auto patternSegments = splitPathSegments(pattern);
+    const auto pathSegments = splitPathSegments(path);
+
+    if (patternSegments.size() != pathSegments.size()) {
+        return false;
+    }
+
+    pathParams.clear();
+    for (size_t index = 0; index < patternSegments.size(); ++index) {
+        const std::string& patternSegment = patternSegments[index];
+        const std::string& pathSegment = pathSegments[index];
+
+        if (patternSegment.size() >= 3 && patternSegment.front() == '{' && patternSegment.back() == '}') {
+            pathParams[patternSegment.substr(1, patternSegment.size() - 2)] = pathSegment;
+            continue;
+        }
+
+        if (patternSegment != pathSegment) {
+            return false;
+        }
+    }
+
+    return true;
 }
 
 std::string HttpServer::getAllowedMethodsForPath(const std::string& path) const {
@@ -500,8 +596,15 @@ std::string HttpServer::getAllowedMethodsForPath(const std::string& path) const 
         }
     }
 
+    for (const auto& routePattern : m_routePatterns) {
+        std::map<std::string, std::string> pathParams;
+        if (matchRoutePattern(routePattern.pattern, path, pathParams)) {
+            methods.push_back(HttpRequest::methodToString(routePattern.method));
+        }
+    }
+
     if (methods.empty()) {
-        return "GET, HEAD";
+        return "GET, HEAD, OPTIONS";
     }
 
     std::sort(methods.begin(), methods.end());
@@ -515,6 +618,13 @@ std::string HttpServer::getAllowedMethodsForPath(const std::string& path) const 
         allow << methods[index];
     }
 
+    if (std::find(methods.begin(), methods.end(), "OPTIONS") == methods.end()) {
+        if (!methods.empty()) {
+            allow << ", ";
+        }
+        allow << "OPTIONS";
+    }
+
     return allow.str();
 }
 
@@ -522,8 +632,13 @@ void HttpServer::registerRoute(HttpRequest::Method method, const std::string& pa
     m_routeHandlers[buildRouteKey(method, path)] = std::move(handler);
 }
 
+void HttpServer::registerRoutePattern(HttpRequest::Method method, const std::string& pathPattern, RequestHandler handler) {
+    m_routePatterns.push_back({method, pathPattern, std::move(handler)});
+}
+
 void HttpServer::registerDefaultRoutes() {
     m_routeHandlers.clear();
+    m_routePatterns.clear();
 
     registerRoute(HttpRequest::METHOD_GET, "/api/echo", [this](const HttpRequest& request) {
         return handleApiEcho(request);
@@ -554,11 +669,137 @@ bool HttpServer::dispatchRoute(const HttpRequest& request, HttpResponse& respons
     const std::string routeKey = buildRouteKey(request.getMethod(), request.getPath());
     const auto it = m_routeHandlers.find(routeKey);
     if (it == m_routeHandlers.end()) {
+        for (const auto& routePattern : m_routePatterns) {
+            if (routePattern.method != request.getMethod()) {
+                continue;
+            }
+
+            std::map<std::string, std::string> pathParams;
+            if (!matchRoutePattern(routePattern.pattern, request.getPath(), pathParams)) {
+                continue;
+            }
+
+            HttpRequest routedRequest = request;
+            routedRequest.setPathParams(pathParams);
+            response = routePattern.handler(routedRequest);
+            return true;
+        }
+
         return false;
     }
 
     response = it->second(request);
     return true;
+}
+
+void HttpServer::runMiddlewareChain(size_t index,
+                                    const HttpRequest& request,
+                                    HttpResponse& response,
+                                    const std::function<void()>& finalHandler) const {
+    if (index >= m_middlewares.size()) {
+        finalHandler();
+        return;
+    }
+
+    const Middleware& middleware = m_middlewares[index];
+    middleware(request, response, [this, index, &request, &response, &finalHandler]() {
+        runMiddlewareChain(index + 1, request, response, finalHandler);
+    });
+}
+
+void HttpServer::processRequest(HttpRequest& request, HttpResponse& response) const {
+    const std::map<std::string, std::string> middlewareHeaders = response.getHeaders();
+
+    HttpResponse generatedResponse;
+    if (m_requestHandler) {
+        generatedResponse = m_requestHandler(request);
+    } else if (!dispatchRoute(request, generatedResponse)) {
+        if (request.getMethod() == HttpRequest::METHOD_GET ||
+            request.getMethod() == HttpRequest::METHOD_HEAD) {
+            generatedResponse = handleStaticFile(request);
+        } else if (request.getMethod() == HttpRequest::METHOD_POST) {
+            generatedResponse = handlePostRequest(request);
+        } else if (request.getMethod() == HttpRequest::METHOD_OPTIONS) {
+            generatedResponse.setStatusCode(HttpResponse::STATUS_204_NO_CONTENT);
+            generatedResponse.addHeader("Allow", getAllowedMethodsForPath(request.getPath()));
+            generatedResponse.setBody("");
+        } else if (request.getMethod() == HttpRequest::METHOD_PUT ||
+                   request.getMethod() == HttpRequest::METHOD_DELETE) {
+            generatedResponse = buildUnifiedErrorResponse(request,
+                                                          HttpResponse::STATUS_405_METHOD_NOT_ALLOWED,
+                                                          "",
+                                                          getAllowedMethodsForPath(request.getPath()));
+        } else {
+            generatedResponse = buildUnifiedErrorResponse(request,
+                                                          HttpResponse::STATUS_501_NOT_IMPLEMENTED,
+                                                          "Unsupported HTTP method");
+        }
+    }
+
+    for (const auto& header : middlewareHeaders) {
+        if (generatedResponse.getHeader(header.first).empty()) {
+            generatedResponse.addHeader(header.first, header.second);
+        }
+    }
+
+    response = std::move(generatedResponse);
+}
+
+HttpResponse HttpServer::buildUnifiedErrorResponse(const HttpRequest& request,
+                                                   int code,
+                                                   const std::string& detail,
+                                                   const std::string& allowMethods) const {
+    const auto statusCode = static_cast<HttpResponse::StatusCode>(code);
+
+    if (containsJsonAcceptHeader(request)) {
+        HttpResponse response = HttpResponse::jsonError(statusCode, detail.empty() ? HttpResponse::statusCodeToString(statusCode) : detail);
+        if (!allowMethods.empty()) {
+            response.addHeader("Allow", allowMethods);
+        }
+        return response;
+    }
+
+    switch (statusCode) {
+        case HttpResponse::STATUS_400_BAD_REQUEST:
+            return HttpResponse::badRequest();
+        case HttpResponse::STATUS_404_NOT_FOUND:
+            return HttpResponse::notFound();
+        case HttpResponse::STATUS_405_METHOD_NOT_ALLOWED:
+            return allowMethods.empty() ? HttpResponse::methodNotAllowed() : HttpResponse::methodNotAllowed(allowMethods);
+        case HttpResponse::STATUS_500_INTERNAL_SERVER_ERROR:
+            return HttpResponse::internalServerError();
+        case HttpResponse::STATUS_501_NOT_IMPLEMENTED:
+            return HttpResponse::notImplemented();
+        default: {
+            HttpResponse response;
+            response.setStatusCode(statusCode);
+            response.setContentType("text/plain; charset=utf-8");
+            response.setBody(detail.empty() ? HttpResponse::statusCodeToString(statusCode) : detail);
+            return response;
+        }
+    }
+}
+
+HttpResponse HttpServer::handleRequest(HttpRequest request) const {
+    HttpResponse response;
+
+    try {
+        auto finalHandler = [&]() {
+            processRequest(request, response);
+        };
+
+        runMiddlewareChain(0, request, response, finalHandler);
+
+        if (request.getMethod() == HttpRequest::METHOD_HEAD) {
+            stripResponseBodyForHead(response);
+        }
+    } catch (const std::exception& e) {
+        response = buildUnifiedErrorResponse(request,
+                                             HttpResponse::STATUS_500_INTERNAL_SERVER_ERROR,
+                                             e.what());
+    }
+
+    return response;
 }
 
 /**
@@ -792,6 +1033,7 @@ bool HttpServer::handleClient(int clientSocket, const std::string& clientIp, int
     HttpResponse response;
     bool parseSuccess = false;
     bool keepAlive = false;
+    size_t declaredResponseSize = 0;
 
     try {
         // 步骤1：解析HTTP请求
@@ -799,32 +1041,21 @@ bool HttpServer::handleClient(int clientSocket, const std::string& clientIp, int
 
         // 检查请求是否有效（如果解析失败，request会是默认构造的无效对象）
         if (request.getUrl().empty()) {
-            response = HttpResponse::badRequest();
+            response = buildUnifiedErrorResponse(request, HttpResponse::STATUS_400_BAD_REQUEST, "Invalid request");
+            declaredResponseSize = response.getBodySize();
             LOG_WARN("Invalid request from " + clientIp + ":" + std::to_string(clientPort));
         } else if (request.getMethod() == HttpRequest::METHOD_UNKNOWN) {
-            response = HttpResponse::notImplemented();
+            response = buildUnifiedErrorResponse(request,
+                                                 HttpResponse::STATUS_501_NOT_IMPLEMENTED,
+                                                 "Unsupported HTTP method");
+            declaredResponseSize = response.getBodySize();
             LOG_WARN("Unsupported HTTP method from " + clientIp + ":" + std::to_string(clientPort));
         } else {
             parseSuccess = true;
-            // 步骤2：根据请求类型调用相应处理函数
-            if (m_requestHandler) {
-                // 使用自定义处理函数
-                response = m_requestHandler(request);
-            } else {
-                if (!dispatchRoute(request, response)) {
-                    if (request.getMethod() == HttpRequest::METHOD_GET ||
-                        request.getMethod() == HttpRequest::METHOD_HEAD) {
-                        response = handleStaticFile(request);
-                    } else if (request.getMethod() == HttpRequest::METHOD_POST) {
-                        response = handlePostRequest(request);
-                    } else if (request.getMethod() == HttpRequest::METHOD_PUT ||
-                               request.getMethod() == HttpRequest::METHOD_DELETE) {
-                        response = HttpResponse::methodNotAllowed(getAllowedMethodsForPath(request.getPath()));
-                    } else {
-                        response = HttpResponse::notImplemented();
-                    }
-                }
-            }
+            runMiddlewareChain(0, request, response, [&]() {
+                processRequest(request, response);
+            });
+            declaredResponseSize = response.getBodySize();
 
             if (request.getMethod() == HttpRequest::METHOD_HEAD) {
                 stripResponseBodyForHead(response);
@@ -833,7 +1064,13 @@ bool HttpServer::handleClient(int clientSocket, const std::string& clientIp, int
     } catch (const std::exception& e) {
         // 捕获异常并返回500错误
         LOG_ERROR("Request handling exception: " + std::string(e.what()));
-        response = HttpResponse::internalServerError();
+        response = buildUnifiedErrorResponse(request,
+                                             HttpResponse::STATUS_500_INTERNAL_SERVER_ERROR,
+                                             e.what());
+        declaredResponseSize = response.getBodySize();
+        if (request.getMethod() == HttpRequest::METHOD_HEAD) {
+            stripResponseBodyForHead(response);
+        }
     }
 
     // 步骤3：判断是否保持连接（Keep-Alive）
@@ -859,7 +1096,7 @@ bool HttpServer::handleClient(int clientSocket, const std::string& clientIp, int
     }
 
     // 步骤4：准备响应体
-    size_t responseSize = 0;
+    size_t responseSize = declaredResponseSize;
     std::string bodyToSend;
     bool useCache = false;
     bool useSendfile = false;  // 是否使用sendfile优化
@@ -1522,6 +1759,9 @@ HttpResponse HttpServer::handleApiEcho(const HttpRequest& request) const {
     response["path"] = request.getPath();
     response["url"] = request.getUrl();
     response["queryParams"] = mapToJsonObject(request.parseQueryParams());
+    if (!request.getPathParams().empty()) {
+        response["pathParams"] = mapToJsonObject(request.getPathParams());
+    }
 
     if (request.getMethod() == HttpRequest::METHOD_POST) {
         response["contentType"] = request.getContentType();
@@ -1543,6 +1783,8 @@ HttpResponse HttpServer::handleHealthCheck() const {
     response["status"] = "ok";
     response["service"] = "CppHttpServer";
     response["routeCount"] = m_routeHandlers.size();
+    response["patternRouteCount"] = m_routePatterns.size();
+    response["middlewareCount"] = m_middlewares.size();
 
     return HttpResponse::jsonResponse(HttpResponse::STATUS_200_OK, response.dump(2));
 }
@@ -1556,6 +1798,9 @@ HttpResponse HttpServer::handleStatusRequest() const {
     response["threads"] = m_numThreads;
     response["cacheEnabled"] = isCacheEnabled();
     response["cacheStats"] = getCacheStats();
+    response["routes"] = m_routeHandlers.size();
+    response["patternRoutes"] = m_routePatterns.size();
+    response["middlewares"] = m_middlewares.size();
 
     return HttpResponse::jsonResponse(HttpResponse::STATUS_200_OK, response.dump(2));
 }

@@ -18,6 +18,7 @@ namespace fs = std::filesystem;
  * 由于信号处理函数不能使用类的成员函数，使用全局指针是必要的解决方案。
  */
 static HttpServer* g_server = nullptr;
+static volatile sig_atomic_t g_reloadRequested = 0;
 
 /**
  * @brief 信号处理函数
@@ -37,6 +38,8 @@ void signalHandler(int signum) {
         // 关闭日志系统
         Logger::getInstance().shutdown();
         exit(0);
+    } else if (signum == SIGHUP) {
+        g_reloadRequested = 1;
     }
 }
 
@@ -51,9 +54,24 @@ struct Config {
     std::string docRoot;   /**< 文档根目录 */
     int debug;             /**< 调试模式 */
     int logToConsole;      /**< 日志是否输出到控制台 (1=是, 0=否) */
+    int cacheEnabled;      /**< 是否启用文件缓存 */
+    size_t cacheMaxSize;   /**< 缓存最大容量 */
+    size_t cacheMaxFileSize; /**< 单文件最大缓存大小 */
     
-    Config() : port(8080), threadPoolSize(8), docRoot("./html_docs"), debug(0), logToConsole(0) {}
+    Config()
+        : port(8080)
+        , threadPoolSize(8)
+        , docRoot("./html_docs")
+        , debug(0)
+        , logToConsole(0)
+        , cacheEnabled(1)
+        , cacheMaxSize(100 * 1024 * 1024)
+        , cacheMaxFileSize(1 * 1024 * 1024) {}
 };
+
+LogLevel debugToLogLevel(int debug) {
+    return debug != 0 ? LogLevel::DEBUG : LogLevel::INFO;
+}
 
 /**
  * @brief 解析配置文件
@@ -105,15 +123,49 @@ bool parseConfigFile(const std::string& configFilePath, Config& config) {
         }
         
         if (key == "port") {
-            config.port = std::stoi(value);
+            try {
+                config.port = std::stoi(value);
+            } catch (...) {
+                std::cerr << "Warning: invalid port value in config: " << value << std::endl;
+            }
         } else if (key == "thread_pool_size") {
-            config.threadPoolSize = std::stoi(value);
+            try {
+                config.threadPoolSize = std::stoi(value);
+            } catch (...) {
+                std::cerr << "Warning: invalid thread_pool_size value in config: " << value << std::endl;
+            }
         } else if (key == "doc_root") {
             config.docRoot = value;
         } else if (key == "debug") {
-            config.debug = std::stoi(value);
+            try {
+                config.debug = std::stoi(value);
+            } catch (...) {
+                std::cerr << "Warning: invalid debug value in config: " << value << std::endl;
+            }
         } else if (key == "log_to_console") {
-            config.logToConsole = std::stoi(value);
+            try {
+                config.logToConsole = std::stoi(value);
+            } catch (...) {
+                std::cerr << "Warning: invalid log_to_console value in config: " << value << std::endl;
+            }
+        } else if (key == "cache_enabled") {
+            try {
+                config.cacheEnabled = std::stoi(value);
+            } catch (...) {
+                std::cerr << "Warning: invalid cache_enabled value in config: " << value << std::endl;
+            }
+        } else if (key == "cache_max_size") {
+            try {
+                config.cacheMaxSize = static_cast<size_t>(std::stoull(value));
+            } catch (...) {
+                std::cerr << "Warning: invalid cache_max_size value in config: " << value << std::endl;
+            }
+        } else if (key == "cache_max_file_size") {
+            try {
+                config.cacheMaxFileSize = static_cast<size_t>(std::stoull(value));
+            } catch (...) {
+                std::cerr << "Warning: invalid cache_max_file_size value in config: " << value << std::endl;
+            }
         }
     }
     
@@ -236,6 +288,16 @@ void printUsage(const char* programName) {
  */
 void printVersion() {
     std::cout << "CppHttpServer version 1.0.0\n";
+}
+
+void applyRuntimeConfig(HttpServer& server, const Config& config, const std::string& resolvedDocRoot) {
+    server.setDocRoot(resolvedDocRoot);
+    server.setCacheEnabled(config.cacheEnabled != 0);
+    server.setCacheMaxSize(config.cacheMaxSize);
+    server.setCacheMaxFileSize(config.cacheMaxFileSize);
+
+    Logger::getInstance().setMinLevel(debugToLogLevel(config.debug));
+    Logger::getInstance().setConsoleOutput(config.logToConsole != 0);
 }
 
 /**
@@ -403,6 +465,7 @@ int main(int argc, char* argv[]) {
      */
     signal(SIGINT, signalHandler);
     signal(SIGTERM, signalHandler);
+    signal(SIGHUP, signalHandler);
 
     // 初始化日志系统
     // 根据配置文件中的 log_to_console 设置决定是否输出到控制台
@@ -413,7 +476,7 @@ int main(int argc, char* argv[]) {
 
     std::string accessLogPath = (logDir / "access.log").string();
     std::string errorLogPath = (logDir / "error.log").string();
-    if (!Logger::getInstance().init(accessLogPath, errorLogPath, LogLevel::INFO, consoleOutput)) {
+    if (!Logger::getInstance().init(accessLogPath, errorLogPath, debugToLogLevel(config.debug), consoleOutput)) {
         std::cerr << "Failed to initialize logger" << std::endl;
         return 1;
     }
@@ -421,11 +484,11 @@ int main(int argc, char* argv[]) {
     /** 创建HTTP服务器实例，监听所有网络接口 */
     HttpServer server("0.0.0.0", port);
 
-    /** 配置服务器文档根目录 */
-    server.setDocRoot(docRoot);
-
-    /** 配置线程池大小 */
+    /** 配置服务器线程池大小 */
     server.setNumThreads(numThreads);
+
+    /** 应用可热更新配置 */
+    applyRuntimeConfig(server, config, docRoot);
 
     /** 保存全局指针以便信号处理函数使用 */
     g_server = &server;
@@ -449,6 +512,27 @@ int main(int argc, char* argv[]) {
      * 这个主循环主要用于保持主线程存活。
      */
     while (server.isRunning()) {
+        if (g_reloadRequested) {
+            g_reloadRequested = 0;
+
+            Config reloadedConfig;
+            if (parseConfigFile(resolvedConfigFile, reloadedConfig)) {
+                docRoot = resolvePathByConfigDir(reloadedConfig.docRoot, resolvedConfigFile);
+                applyRuntimeConfig(server, reloadedConfig, docRoot);
+                config = reloadedConfig;
+                LOG_INFO("Reloaded config from: " + resolvedConfigFile);
+
+                if (reloadedConfig.port != server.getPort()) {
+                    LOG_WARN("Reloaded config changed port; restart is required to apply it");
+                }
+                if (reloadedConfig.threadPoolSize != server.getNumThreads()) {
+                    LOG_WARN("Reloaded config changed thread pool size; restart is required to apply it");
+                }
+            } else {
+                LOG_WARN("Failed to reload config from: " + resolvedConfigFile);
+            }
+        }
+
         std::this_thread::sleep_for(std::chrono::seconds(1));
     }
 

@@ -37,6 +37,7 @@ public:
      */
     enum Method {
         METHOD_GET,     /**< GET方法：请求获取指定资源 */
+        METHOD_OPTIONS, /**< OPTIONS方法：查询支持的通信选项 */
         METHOD_POST,   /**< POST方法：向指定资源提交数据 */
         METHOD_PUT,    /**< PUT方法：替换指定资源 */
         METHOD_DELETE, /**< DELETE方法：删除指定资源 */
@@ -268,6 +269,35 @@ public:
     std::map<std::string, std::string> parseJsonBody() const;
 
     /**
+     * @brief 设置路径参数
+     *
+     * 路由系统在匹配到路径参数后调用，用于让处理器读取诸如 /users/{id} 里的 id。
+     *
+     * @param pathParams 路径参数键值对
+     */
+    void setPathParams(const std::map<std::string, std::string>& pathParams);
+
+    /**
+     * @brief 获取所有路径参数
+     *
+     * @return std::map<std::string, std::string> 路径参数键值对
+     */
+    std::map<std::string, std::string> getPathParams() const;
+
+    /**
+     * @brief 获取指定路径参数
+     *
+     * @param key 参数名
+     * @return std::string 参数值，不存在返回空字符串
+     */
+    std::string getPathParam(const std::string& key) const;
+
+    /**
+     * @brief 清空路径参数
+     */
+    void clearPathParams();
+
+    /**
      * @brief 获取统一参数值
      * 
      * 依次从查询参数、表单参数和JSON请求体中查找指定键。
@@ -310,6 +340,9 @@ private:
 
     /** 请求体内容 */
     std::string m_body;
+
+    /** 路径参数 */
+    std::map<std::string, std::string> m_pathParams;
 
     /** 客户端IP地址 */
     std::string m_clientIp;
