@@ -10,6 +10,296 @@
 
 #include <algorithm>     
 #include <cstring>       // C字符串处理
+#include <cctype>
+
+namespace {
+
+/**
+ * @brief 去除字符串两端的空白字符
+ *
+ * 用于在解析请求参数和JSON片段时清理多余空白，避免空格和换行影响匹配结果。
+ *
+ * @param input 原始字符串
+ * @return std::string 去除首尾空白后的字符串
+ */
+std::string trimWhitespace(const std::string& input) {
+    const size_t start = input.find_first_not_of(" \t\r\n");
+    if (start == std::string::npos) {
+        return "";
+    }
+
+    const size_t end = input.find_last_not_of(" \t\r\n");
+    return input.substr(start, end - start + 1);
+}
+
+/**
+ * @brief 生成字符串的小写副本
+ *
+ * 该函数不会修改原始输入，常用于对HTTP头部值做大小写不敏感比较。
+ *
+ * @param input 原始字符串
+ * @return std::string 转换为小写后的副本
+ */
+std::string toLowerCopy(const std::string& input) {
+    std::string output = input;
+    std::transform(output.begin(), output.end(), output.begin(), [](unsigned char ch) {
+        return static_cast<char>(std::tolower(ch));
+    });
+    return output;
+}
+
+/**
+ * @brief 解析URL编码的键值对字符串
+ *
+ * 支持 application/x-www-form-urlencoded 常见格式：
+ * key1=value1&key2=value2
+ *
+ * @param encoded 已URL编码的查询串或表单串
+ * @return std::map<std::string, std::string> 解析得到的键值对
+ */
+std::map<std::string, std::string> parseUrlEncodedPairs(const std::string& encoded) {
+    std::map<std::string, std::string> params;
+
+    size_t start = 0;
+    while (start < encoded.length()) {
+        size_t ampPos = encoded.find('&', start);
+        std::string pair;
+
+        if (ampPos == std::string::npos) {
+            pair = encoded.substr(start);
+            start = encoded.length();
+        } else {
+            pair = encoded.substr(start, ampPos - start);
+            start = ampPos + 1;
+        }
+
+        if (pair.empty()) {
+            continue;
+        }
+
+        size_t eqPos = pair.find('=');
+        if (eqPos != std::string::npos) {
+            std::string key = HttpRequest::urlDecode(pair.substr(0, eqPos));
+            std::string value = HttpRequest::urlDecode(pair.substr(eqPos + 1));
+            params[key] = value;
+        } else {
+            params[HttpRequest::urlDecode(pair)] = "";
+        }
+    }
+
+    return params;
+}
+
+/**
+ * @brief 解析JSON字符串字面量
+ *
+ * 处理带引号的JSON字符串，支持常见转义字符与\u 转义的原样保留。
+ * 该函数仅负责解析字符串标记，不处理外层对象结构。
+ *
+ * @param input JSON文本
+ * @param position 当前解析位置，成功时会前移到结束引号之后
+ * @param output 解析后的字符串内容
+ * @return bool 解析成功返回true，否则返回false
+ */
+bool parseJsonString(const std::string& input, size_t& position, std::string& output) {
+    if (position >= input.length() || input[position] != '"') {
+        return false;
+    }
+
+    ++position;
+    output.clear();
+    while (position < input.length()) {
+        char ch = input[position++];
+        if (ch == '"') {
+            return true;
+        }
+
+        if (ch == '\\') {
+            if (position >= input.length()) {
+                return false;
+            }
+
+            char escaped = input[position++];
+            switch (escaped) {
+                case '"': output.push_back('"'); break;
+                case '\\': output.push_back('\\'); break;
+                case '/': output.push_back('/'); break;
+                case 'b': output.push_back('\b'); break;
+                case 'f': output.push_back('\f'); break;
+                case 'n': output.push_back('\n'); break;
+                case 'r': output.push_back('\r'); break;
+                case 't': output.push_back('\t'); break;
+                case 'u':
+                    if (position + 3 >= input.length()) {
+                        return false;
+                    }
+                    output.push_back('\\');
+                    output.push_back('u');
+                    output.push_back(input[position++]);
+                    output.push_back(input[position++]);
+                    output.push_back(input[position++]);
+                    output.push_back(input[position++]);
+                    break;
+                default:
+                    output.push_back(escaped);
+                    break;
+            }
+            continue;
+        }
+
+        output.push_back(ch);
+    }
+
+    return false;
+}
+
+/**
+ * @brief 解析JSON值片段
+ *
+ * 该函数用于从对象字段值位置提取一个完整的JSON值文本。
+ * 如果值是字符串，会返回去引号后的字符串内容；
+ * 如果值是对象、数组、数字、布尔值或null，则返回对应的原始文本。
+ *
+ * @param input JSON文本
+ * @param position 当前解析位置，成功时会前移到值结束位置
+ * @return std::string 解析得到的值文本，失败时返回空字符串
+ */
+std::string parseJsonValueToken(const std::string& input, size_t& position) {
+    while (position < input.length() && std::isspace(static_cast<unsigned char>(input[position]))) {
+        ++position;
+    }
+
+    if (position >= input.length()) {
+        return "";
+    }
+
+    if (input[position] == '"') {
+        std::string value;
+        if (!parseJsonString(input, position, value)) {
+            return "";
+        }
+        return value;
+    }
+
+    const size_t start = position;
+    int braceDepth = 0;
+    int bracketDepth = 0;
+    bool inString = false;
+    bool escaped = false;
+
+    while (position < input.length()) {
+        char ch = input[position];
+        if (inString) {
+            if (escaped) {
+                escaped = false;
+            } else if (ch == '\\') {
+                escaped = true;
+            } else if (ch == '"') {
+                inString = false;
+            }
+            ++position;
+            continue;
+        }
+
+        if (ch == '"') {
+            inString = true;
+            ++position;
+            continue;
+        }
+
+        if (ch == '{') {
+            ++braceDepth;
+        } else if (ch == '}') {
+            if (braceDepth == 0 && bracketDepth == 0) {
+                break;
+            }
+            --braceDepth;
+        } else if (ch == '[') {
+            ++bracketDepth;
+        } else if (ch == ']') {
+            --bracketDepth;
+        } else if (ch == ',' && braceDepth == 0 && bracketDepth == 0) {
+            break;
+        }
+
+        ++position;
+    }
+
+    return trimWhitespace(input.substr(start, position - start));
+}
+
+/**
+ * @brief 解析顶层JSON对象
+ *
+ * 仅支持标准对象结构，返回对象中的字段映射。
+ * 该实现的目标是满足HTTP请求参数提取场景，而不是完整的JSON DOM 解析器。
+ *
+ * @param body JSON请求体文本
+ * @return std::map<std::string, std::string> 顶层键值对
+ */
+std::map<std::string, std::string> parseJsonObjectBody(const std::string& body) {
+    std::map<std::string, std::string> values;
+    size_t position = 0;
+
+    while (position < body.length() && std::isspace(static_cast<unsigned char>(body[position]))) {
+        ++position;
+    }
+
+    if (position >= body.length() || body[position] != '{') {
+        return values;
+    }
+    ++position;
+
+    while (position < body.length()) {
+        while (position < body.length() && std::isspace(static_cast<unsigned char>(body[position]))) {
+            ++position;
+        }
+
+        if (position < body.length() && body[position] == '}') {
+            ++position;
+            break;
+        }
+
+        std::string key;
+        if (!parseJsonString(body, position, key)) {
+            return std::map<std::string, std::string>();
+        }
+
+        while (position < body.length() && std::isspace(static_cast<unsigned char>(body[position]))) {
+            ++position;
+        }
+
+        if (position >= body.length() || body[position] != ':') {
+            return std::map<std::string, std::string>();
+        }
+        ++position;
+
+        std::string value = parseJsonValueToken(body, position);
+        values[key] = value;
+
+        while (position < body.length() && std::isspace(static_cast<unsigned char>(body[position]))) {
+            ++position;
+        }
+
+        if (position < body.length() && body[position] == ',') {
+            ++position;
+            continue;
+        }
+
+        if (position < body.length() && body[position] == '}') {
+            ++position;
+            break;
+        }
+
+        if (position < body.length()) {
+            return std::map<std::string, std::string>();
+        }
+    }
+
+    return values;
+}
+
+} // namespace
 
 /**
  * @brief 构造函数
@@ -207,7 +497,7 @@ int HttpRequest::getClientPort() const {
 /**
  * @brief 清空请求
  *
- * 重置所有成员变量到初始状态。
+ * 重置所有成员变量到初始状态，适用于对象复用和连接池场景。
  */
 void HttpRequest::clear() {
     m_method = METHOD_UNKNOWN;
@@ -242,6 +532,7 @@ std::string HttpRequest::getVersion() const {
  * @brief 将字符串转换为HTTP方法枚举
  * 
  * 静态方法，支持不区分大小写的比较。
+ * 未识别的方法会返回 METHOD_UNKNOWN，便于上层统一走错误响应分支。
  * 
  * @param method HTTP方法名字符串
  * @return Method 对应的枚举值
@@ -260,6 +551,7 @@ HttpRequest::Method HttpRequest::stringToMethod(const std::string& method) {
  * @brief 将HTTP方法枚举转换为字符串
  * 
  * 静态方法，将枚举值转换为可读的方法名字符串。
+ * 该函数主要用于日志输出、响应调试和协议信息回显。
  * 
  * @param method HTTP方法枚举值
  * @return std::string 方法名字符串
@@ -279,7 +571,8 @@ std::string HttpRequest::methodToString(Method method) {
  * @brief URL解码函数
  * 
  * 将URL编码的字符串解码为原始字符串。
- * 支持 %XX 格式的编码（如 %20 转换为空格）。
+ * 支持 %XX 格式的编码（如 %20 转换为空格）以及 + 到空格的转换。
+ * 对非法十六进制片段保持宽松处理，不会抛出异常。
  * 
  * @param encoded URL编码的字符串
  * @return std::string 解码后的字符串
@@ -322,49 +615,39 @@ std::string HttpRequest::urlDecode(const std::string& encoded) {
  * 
  * 从URL的查询字符串中解析出键值对参数。
  * 格式: ?key1=value1&key2=value2
+ * 若URL中不存在查询串，则返回空集合。
  * 
  * @return std::map<std::string, std::string> 参数键值对
  */
 std::map<std::string, std::string> HttpRequest::parseQueryParams() const {
-    std::map<std::string, std::string> params;
-    
     // 查找查询字符串起始位置
     size_t queryPos = m_url.find('?');
     if (queryPos == std::string::npos) {
-        return params;  // 没有查询字符串
+        return {};  // 没有查询字符串
     }
     
     // 提取查询字符串部分（去掉?）
     std::string queryString = m_url.substr(queryPos + 1);
-    
-    // 解析键值对
-    size_t start = 0;
-    while (start < queryString.length()) {
-        // 查找 & 分隔符
-        size_t ampPos = queryString.find('&', start);
-        std::string pair;
-        
-        if (ampPos == std::string::npos) {
-            pair = queryString.substr(start);
-            start = queryString.length();
-        } else {
-            pair = queryString.substr(start, ampPos - start);
-            start = ampPos + 1;
-        }
-        
-        // 解析 key=value
-        size_t eqPos = pair.find('=');
-        if (eqPos != std::string::npos) {
-            std::string key = urlDecode(pair.substr(0, eqPos));
-            std::string value = urlDecode(pair.substr(eqPos + 1));
-            params[key] = value;
-        } else if (!pair.empty()) {
-            // 只有key没有value的情况
-            params[urlDecode(pair)] = "";
-        }
+
+    return parseUrlEncodedPairs(queryString);
+}
+
+/**
+ * @brief 解析请求体中的表单数据
+ * 
+ * 根据Content-Type解析请求体中的表单数据。
+ * 支持 application/x-www-form-urlencoded 格式。
+ * 如果Content-Type不匹配，则返回空集合。
+ * 
+ * @return std::map<std::string, std::string> 表单数据键值对
+ */
+std::map<std::string, std::string> HttpRequest::parseBodyParams() const {
+    std::string contentType = toLowerCopy(getContentType());
+    if (contentType.find("application/x-www-form-urlencoded") == std::string::npos) {
+        return {};
     }
-    
-    return params;
+
+    return parseUrlEncodedPairs(m_body);
 }
 
 /**
@@ -372,51 +655,68 @@ std::map<std::string, std::string> HttpRequest::parseQueryParams() const {
  * 
  * 根据Content-Type解析请求体中的表单数据。
  * 支持 application/x-www-form-urlencoded 格式。
+ * 该接口是 parseBodyParams 的语义别名，便于上层按请求类型阅读代码。
  * 
  * @return std::map<std::string, std::string> 表单数据键值对
  */
 std::map<std::string, std::string> HttpRequest::parseFormData() const {
-    std::map<std::string, std::string> formData;
-    
-    // 检查Content-Type是否为表单类型
-    std::string contentType = getContentType();
-    if (contentType.find("application/x-www-form-urlencoded") == std::string::npos) {
-        return formData;  // 不是URL编码的表单数据
+    return parseBodyParams();
+}
+
+/**
+ * @brief 解析JSON请求体
+ * 
+ * 仅支持顶层JSON对象。
+ * 当Content-Type不是JSON相关类型时返回空集合。
+ * 
+ * @return std::map<std::string, std::string> JSON字段键值对
+ */
+std::map<std::string, std::string> HttpRequest::parseJsonBody() const {
+    std::string contentType = toLowerCopy(getContentType());
+    if (contentType.find("application/json") == std::string::npos &&
+        contentType.find("+json") == std::string::npos) {
+        return {};
     }
-    
-    // 请求体格式与查询字符串相同: key1=value1&key2=value2
-    size_t start = 0;
-    while (start < m_body.length()) {
-        // 查找 & 分隔符
-        size_t ampPos = m_body.find('&', start);
-        std::string pair;
-        
-        if (ampPos == std::string::npos) {
-            pair = m_body.substr(start);
-            start = m_body.length();
-        } else {
-            pair = m_body.substr(start, ampPos - start);
-            start = ampPos + 1;
-        }
-        
-        // 解析 key=value
-        size_t eqPos = pair.find('=');
-        if (eqPos != std::string::npos) {
-            std::string key = urlDecode(pair.substr(0, eqPos));
-            std::string value = urlDecode(pair.substr(eqPos + 1));
-            formData[key] = value;
-        } else if (!pair.empty()) {
-            // 只有key没有value的情况
-            formData[urlDecode(pair)] = "";
-        }
+
+    return parseJsonObjectBody(m_body);
+}
+
+/**
+ * @brief 获取统一参数值
+ * 
+ * 依次从查询参数、表单参数和JSON请求体中查找指定键。
+ * 查找顺序固定，前面的来源具有更高优先级，适合统一参数读取入口。
+ * 
+ * @param key 参数名
+ * @return std::string 参数值，不存在则返回空字符串
+ */
+std::string HttpRequest::getParameter(const std::string& key) const {
+    const auto queryParams = parseQueryParams();
+    const auto queryIt = queryParams.find(key);
+    if (queryIt != queryParams.end()) {
+        return queryIt->second;
     }
-    
-    return formData;
+
+    const auto formParams = parseBodyParams();
+    const auto formIt = formParams.find(key);
+    if (formIt != formParams.end()) {
+        return formIt->second;
+    }
+
+    const auto jsonParams = parseJsonBody();
+    const auto jsonIt = jsonParams.find(key);
+    if (jsonIt != jsonParams.end()) {
+        return jsonIt->second;
+    }
+
+    return "";
 }
 
 /**
  * @brief 获取Content-Type头部值
  * 
+ * 这是对请求头的便捷访问封装，便于表单和JSON解析逻辑复用。
+ *
  * @return std::string Content-Type值，如果不存在返回空字符串
  */
 std::string HttpRequest::getContentType() const {

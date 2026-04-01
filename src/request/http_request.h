@@ -238,6 +238,15 @@ public:
     std::map<std::string, std::string> parseQueryParams() const;
 
     /**
+     * @brief 解析请求体中的表单数据
+     * 
+     * 仅在 Content-Type 为 application/x-www-form-urlencoded 时生效。
+     * 
+     * @return std::map<std::string, std::string> 表单数据键值对
+     */
+    std::map<std::string, std::string> parseBodyParams() const;
+
+    /**
      * @brief 解析POST请求体中的表单数据
      * 
      * 根据Content-Type解析请求体中的表单数据。
@@ -246,6 +255,27 @@ public:
      * @return std::map<std::string, std::string> 表单数据键值对
      */
     std::map<std::string, std::string> parseFormData() const;
+
+    /**
+     * @brief 解析JSON请求体
+     * 
+     * 仅支持顶层JSON对象，返回键值对映射。
+     * 字符串、数字、布尔值和null会被转换为字符串形式。
+     * 嵌套对象和数组会以原始JSON文本保留。
+     * 
+     * @return std::map<std::string, std::string> JSON字段键值对
+     */
+    std::map<std::string, std::string> parseJsonBody() const;
+
+    /**
+     * @brief 获取统一参数值
+     * 
+     * 依次从查询参数、表单参数和JSON请求体中查找指定键。
+     * 
+     * @param key 参数名
+     * @return std::string 参数值，不存在则返回空字符串
+     */
+    std::string getParameter(const std::string& key) const;
 
     /**
      * @brief 获取Content-Type头部值

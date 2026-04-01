@@ -35,6 +35,7 @@
 #include <limits>           // 数值边界
 #include <iostream>          // 输入输出
 #include <unordered_map>     // socket读取缓冲
+#include <vector>
 
 // 为兼容旧版本系统，定义EPOLLRDHUP（如果未定义）
 #ifndef EPOLLRDHUP
@@ -44,6 +45,42 @@
 namespace {
 std::mutex g_readBufferMutex;
 std::unordered_map<int, std::string> g_socketReadBuffers;
+
+std::string jsonQuote(const std::string& value) {
+    return "\"" + HttpResponse::escapeJsonString(value) + "\"";
+}
+
+void appendStringMapJson(std::ostringstream& json,
+                         const std::string& indent,
+                         const std::map<std::string, std::string>& values,
+                         bool rawValues = false) {
+    json << "{\n";
+    bool first = true;
+    for (const auto& pair : values) {
+        if (!first) {
+            json << ",\n";
+        }
+
+        json << indent << "  " << jsonQuote(pair.first) << ": ";
+        if (rawValues) {
+            const std::string& raw = pair.second;
+            if (!raw.empty() && (raw.front() == '{' || raw.front() == '[' || raw == "true" || raw == "false" || raw == "null")) {
+                json << raw;
+            } else {
+                json << jsonQuote(raw);
+            }
+        } else {
+            json << jsonQuote(pair.second);
+        }
+
+        first = false;
+    }
+
+    if (!values.empty()) {
+        json << "\n" << indent;
+    }
+    json << "}";
+}
 
 enum class RangeParseResult {
     NOT_PRESENT,
@@ -465,6 +502,34 @@ std::string HttpServer::buildRouteKey(HttpRequest::Method method, const std::str
     return HttpRequest::methodToString(method) + " " + path;
 }
 
+std::string HttpServer::getAllowedMethodsForPath(const std::string& path) const {
+    std::vector<std::string> methods;
+    for (const auto& pair : m_routeHandlers) {
+        const std::string suffix = " " + path;
+        if (pair.first.size() > suffix.size() &&
+            pair.first.compare(pair.first.size() - suffix.size(), suffix.size(), suffix) == 0) {
+            methods.push_back(pair.first.substr(0, pair.first.size() - suffix.size()));
+        }
+    }
+
+    if (methods.empty()) {
+        return "GET, HEAD";
+    }
+
+    std::sort(methods.begin(), methods.end());
+    methods.erase(std::unique(methods.begin(), methods.end()), methods.end());
+
+    std::ostringstream allow;
+    for (size_t index = 0; index < methods.size(); ++index) {
+        if (index > 0) {
+            allow << ", ";
+        }
+        allow << methods[index];
+    }
+
+    return allow.str();
+}
+
 void HttpServer::registerRoute(HttpRequest::Method method, const std::string& path, RequestHandler handler) {
     m_routeHandlers[buildRouteKey(method, path)] = std::move(handler);
 }
@@ -766,7 +831,7 @@ bool HttpServer::handleClient(int clientSocket, const std::string& clientIp, int
                         response = handlePostRequest(request);
                     } else if (request.getMethod() == HttpRequest::METHOD_PUT ||
                                request.getMethod() == HttpRequest::METHOD_DELETE) {
-                        response = HttpResponse::methodNotAllowed();
+                        response = HttpResponse::methodNotAllowed(getAllowedMethodsForPath(request.getPath()));
                     } else {
                         response = HttpResponse::notImplemented();
                     }
@@ -1436,23 +1501,28 @@ ssize_t HttpServer::sendData(int socket, const char* data, size_t size) const {
  * @return HttpResponse POST响应对象
  */
 HttpResponse HttpServer::handlePostRequest(const HttpRequest& request) const {
-    HttpResponse response;
-    response.setStatusCode(HttpResponse::STATUS_200_OK);
-    response.addHeader("Content-Type", "application/json; charset=utf-8");
-
-    std::string path = request.getPath();
-    
-    // 其他POST请求返回简单的确认信息
     std::ostringstream json;
     json << "{\n";
     json << "  \"status\": \"success\",\n";
     json << "  \"message\": \"POST request received\",\n";
-    json << "  \"path\": \"" << path << "\",\n";
-    json << "  \"bodyLength\": " << request.getBody().length() << "\n";
+    json << "  \"path\": " << jsonQuote(request.getPath()) << ",\n";
+    json << "  \"bodyLength\": " << request.getBody().length() << ",\n";
+    json << "  \"contentType\": " << jsonQuote(request.getContentType()) << ",\n";
+
+    const auto formData = request.parseFormData();
+    const auto jsonBody = request.parseJsonBody();
+    if (!jsonBody.empty()) {
+        json << "  \"jsonBody\": ";
+        appendStringMapJson(json, "  ", jsonBody, true);
+        json << "\n";
+    } else {
+        json << "  \"formData\": ";
+        appendStringMapJson(json, "  ", formData);
+        json << "\n";
+    }
     json << "}";
-    
-    response.setBody(json.str());
-    return response;
+
+    return HttpResponse::jsonResponse(HttpResponse::STATUS_200_OK, json.str());
 }
 
 /**
@@ -1465,59 +1535,36 @@ HttpResponse HttpServer::handlePostRequest(const HttpRequest& request) const {
  * @return HttpResponse JSON响应对象
  */
 HttpResponse HttpServer::handleApiEcho(const HttpRequest& request) const {
-    HttpResponse response;
-    response.setStatusCode(HttpResponse::STATUS_200_OK);
-    response.addHeader("Content-Type", "application/json; charset=utf-8");
-
-    std::string path = request.getPath();
-    std::string method = HttpRequest::methodToString(request.getMethod());
-
-    // 构建JSON响应
     std::ostringstream json;
     json << "{\n";
-    json << "  \"method\": \"" << method << "\",\n";
-    json << "  \"path\": \"" << path << "\",\n";
-    json << "  \"url\": \"" << request.getUrl() << "\",\n";
+    json << "  \"method\": " << jsonQuote(HttpRequest::methodToString(request.getMethod())) << ",\n";
+    json << "  \"path\": " << jsonQuote(request.getPath()) << ",\n";
+    json << "  \"url\": " << jsonQuote(request.getUrl()) << ",\n";
 
-    // 解析并输出查询参数
-    auto queryParams = request.parseQueryParams();
-    json << "  \"queryParams\": {\n";
-    bool first = true;
-    for (const auto& pair : queryParams) {
-        if (!first) json << ",\n";
-        json << "    \"" << pair.first << "\": \"" << pair.second << "\"";
-        first = false;
-    }
-    json << "\n  }";
+    json << "  \"queryParams\": ";
+    appendStringMapJson(json, "  ", request.parseQueryParams());
 
-    // 如果是POST请求，也输出表单数据
     if (request.getMethod() == HttpRequest::METHOD_POST) {
         json << ",\n";
-        json << "  \"contentType\": \"" << request.getContentType() << "\",\n";
-        json << "  \"body\": \"" << request.getBody() << "\",\n";
+        json << "  \"contentType\": " << jsonQuote(request.getContentType()) << ",\n";
+        json << "  \"body\": " << jsonQuote(request.getBody()) << ",\n";
 
-        auto formData = request.parseFormData();
-        json << "  \"formData\": {\n";
-        first = true;
-        for (const auto& pair : formData) {
-            if (!first) json << ",\n";
-            json << "    \"" << pair.first << "\": \"" << pair.second << "\"";
-            first = false;
+        const auto jsonBody = request.parseJsonBody();
+        if (!jsonBody.empty()) {
+            json << "  \"jsonBody\": ";
+            appendStringMapJson(json, "  ", jsonBody, true);
+        } else {
+            json << "  \"formData\": ";
+            appendStringMapJson(json, "  ", request.parseFormData());
         }
-        json << "\n  }";
     }
 
     json << "\n}";
 
-    response.setBody(json.str());
-    return response;
+    return HttpResponse::jsonResponse(HttpResponse::STATUS_200_OK, json.str());
 }
 
 HttpResponse HttpServer::handleHealthCheck() const {
-    HttpResponse response;
-    response.setStatusCode(HttpResponse::STATUS_200_OK);
-    response.addHeader("Content-Type", "application/json; charset=utf-8");
-
     std::ostringstream json;
     json << "{\n";
     json << "  \"status\": \"ok\",\n";
@@ -1525,26 +1572,20 @@ HttpResponse HttpServer::handleHealthCheck() const {
     json << "  \"routeCount\": " << m_routeHandlers.size() << "\n";
     json << "}";
 
-    response.setBody(json.str());
-    return response;
+    return HttpResponse::jsonResponse(HttpResponse::STATUS_200_OK, json.str());
 }
 
 HttpResponse HttpServer::handleStatusRequest() const {
-    HttpResponse response;
-    response.setStatusCode(HttpResponse::STATUS_200_OK);
-    response.addHeader("Content-Type", "application/json; charset=utf-8");
-
     std::ostringstream json;
     json << "{\n";
     json << "  \"running\": " << (m_running.load() ? "true" : "false") << ",\n";
-    json << "  \"ip\": \"" << m_ip << "\",\n";
+    json << "  \"ip\": " << jsonQuote(m_ip) << ",\n";
     json << "  \"port\": " << m_port << ",\n";
-    json << "  \"docRoot\": \"" << m_docRoot << "\",\n";
+    json << "  \"docRoot\": " << jsonQuote(m_docRoot) << ",\n";
     json << "  \"threads\": " << m_numThreads << ",\n";
     json << "  \"cacheEnabled\": " << (isCacheEnabled() ? "true" : "false") << ",\n";
     json << "  \"cacheStats\": " << getCacheStats() << "\n";
     json << "}";
 
-    response.setBody(json.str());
-    return response;
+    return HttpResponse::jsonResponse(HttpResponse::STATUS_200_OK, json.str());
 }

@@ -244,6 +244,38 @@ public:
     static std::string statusCodeToString(StatusCode code);
 
     /**
+     * @brief 转义JSON字符串
+     * 
+     * 将普通文本转义为可安全放入JSON字符串字面量中的内容。
+     * 
+     * @param text 原始文本
+     * @return std::string JSON转义后的字符串内容（不含外层引号）
+     */
+    static std::string escapeJsonString(const std::string& text);
+
+    /**
+     * @brief 创建JSON响应
+     * 
+     * 自动设置JSON Content-Type，并写入指定JSON文本作为响应体。
+     * 
+     * @param code 状态码
+     * @param jsonBody 已构造好的JSON文本
+     * @return HttpResponse JSON响应对象
+     */
+    static HttpResponse jsonResponse(StatusCode code, const std::string& jsonBody);
+
+    /**
+     * @brief 创建JSON错误响应
+     * 
+     * 生成统一的JSON错误包裹格式。
+     * 
+     * @param code 状态码
+     * @param message 错误消息
+     * @return HttpResponse JSON错误响应对象
+     */
+    static HttpResponse jsonError(StatusCode code, const std::string& message);
+
+    /**
      * @brief 根据文件扩展名获取Content-Type
      * 
      * 静态方法，根据文件扩展名自动判断MIME类型。
@@ -282,6 +314,14 @@ public:
      * @return HttpResponse 预配置的405错误响应对象
      */
     static HttpResponse methodNotAllowed();
+
+    /**
+     * @brief 创建405 Method Not Allowed响应
+     * 
+     * @param allowMethods Allow头部值，例如"GET, HEAD"
+     * @return HttpResponse 预配置的405错误响应对象
+     */
+    static HttpResponse methodNotAllowed(const std::string& allowMethods);
 
     /**
      * @brief 创建500 Internal Server Error响应

@@ -304,6 +304,11 @@ private:
     std::string buildRouteKey(HttpRequest::Method method, const std::string& path) const;
 
     /**
+     * @brief 获取指定路径允许的方法列表
+     */
+    std::string getAllowedMethodsForPath(const std::string& path) const;
+
+    /**
      * @brief 分发到显式路由
      */
     bool dispatchRoute(const HttpRequest& request, HttpResponse& response) const;

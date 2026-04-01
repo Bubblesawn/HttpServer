@@ -57,10 +57,31 @@ void testHttpRequestParsing() {
     expectEqual(queryParams.at("q"), "hello world", "query params should decode plus to space");
     expectEqual(queryParams.at("lang"), "zh-cn", "query params should preserve simple values");
 
+    expectEqual(request.getParameter("q"), "hello world", "unified parameter lookup should read query params first");
+
     const auto formData = request.parseFormData();
     expectTrue(formData.size() == 2, "form data should contain two entries");
     expectEqual(formData.at("name"), "alice smith", "form data should decode plus to space");
     expectEqual(formData.at("city"), "北京", "form data should decode percent-encoded utf-8 bytes");
+
+    request.setBody("name=alice+smith&city=%E5%8C%97%E4%BA%AC");
+    expectEqual(request.getParameter("name"), "alice smith", "unified parameter lookup should read form body values");
+}
+
+void testHttpRequestJsonParsing() {
+    HttpRequest request;
+    request.setMethodString("post");
+    request.setUrl("/api/items");
+    request.addHeader("Content-Type", "application/json; charset=utf-8");
+    request.setBody("{\"name\":\"widget\",\"count\":3,\"active\":true,\"meta\":{\"color\":\"blue\"}}");
+
+    const auto jsonBody = request.parseJsonBody();
+    expectTrue(jsonBody.size() == 4, "json body should contain four top-level entries");
+    expectEqual(jsonBody.at("name"), "widget", "json string values should be decoded");
+    expectEqual(jsonBody.at("count"), "3", "json numeric values should be preserved as text");
+    expectEqual(jsonBody.at("active"), "true", "json boolean values should be preserved as text");
+    expectEqual(jsonBody.at("meta"), "{\"color\":\"blue\"}", "nested json should be preserved as raw text");
+    expectEqual(request.getParameter("meta"), "{\"color\":\"blue\"}", "unified parameter lookup should read json body values");
 }
 
 void testHttpRequestClear() {
@@ -105,6 +126,20 @@ void testHttpResponseSerialization() {
     expectTrue(header.find("missing") == std::string::npos, "header string should not include body bytes");
 }
 
+void testHttpResponseStandardizedHelpers() {
+    const HttpResponse jsonResponse = HttpResponse::jsonError(HttpResponse::STATUS_400_BAD_REQUEST, "bad \"input\"");
+    const std::string header = jsonResponse.buildHeaderString(jsonResponse.getBodySize());
+
+    expectTrue(jsonResponse.getContentType() == "application/json; charset=utf-8", "json helper should set json content type");
+    expectTrue(jsonResponse.getBody().find("\\\"input\\\"") != std::string::npos, "json error body should escape quotes");
+    expectTrue(header.find("Content-Type: application/json; charset=utf-8\r\n") != std::string::npos, "json helper should serialize json content type");
+    expectTrue(header.find("Content-Length: ") != std::string::npos, "json helper should always serialize content length");
+
+    HttpResponse emptyResponse;
+    const std::string emptyHeader = emptyResponse.buildHeaderString(0);
+    expectTrue(emptyHeader.find("Content-Length: 0\r\n") != std::string::npos, "zero-length responses should still carry content length");
+}
+
 void testHttpResponseFileBodySize() {
     const std::filesystem::path tempFile = std::filesystem::temp_directory_path() / "http_server_test_body.txt";
     {
@@ -123,6 +158,7 @@ void testHttpResponseFileBodySize() {
 
 void testHttpResponseErrorFactories() {
     const HttpResponse methodNotAllowed = HttpResponse::methodNotAllowed();
+    const HttpResponse methodNotAllowedWithAllow = HttpResponse::methodNotAllowed("GET, HEAD, POST");
     const HttpResponse notImplemented = HttpResponse::notImplemented();
 
     expectTrue(methodNotAllowed.getStatusCode() == HttpResponse::STATUS_405_METHOD_NOT_ALLOWED,
@@ -131,6 +167,8 @@ void testHttpResponseErrorFactories() {
                "notImplemented should set 501 status");
     expectTrue(methodNotAllowed.buildHeaderString(methodNotAllowed.getBodySize()).find("Connection: Close\r\n") != std::string::npos,
                "405 response should serialize default close connection");
+    expectTrue(methodNotAllowedWithAllow.buildHeaderString(methodNotAllowedWithAllow.getBodySize()).find("Allow: GET, HEAD, POST\r\n") != std::string::npos,
+               "405 response should expose Allow header when provided");
     expectTrue(notImplemented.buildHeaderString(notImplemented.getBodySize()).find("Connection: Close\r\n") != std::string::npos,
                "501 response should serialize default close connection");
 }
@@ -139,8 +177,10 @@ void testHttpResponseErrorFactories() {
 
 int main() {
     testHttpRequestParsing();
+    testHttpRequestJsonParsing();
     testHttpRequestClear();
     testHttpResponseSerialization();
+    testHttpResponseStandardizedHelpers();
     testHttpResponseFileBodySize();
     testHttpResponseErrorFactories();
 

@@ -11,6 +11,33 @@
 #include <sys/stat.h>      // 文件状态
 #include <iostream>        // 输入输出
 
+namespace {
+
+void appendSerializedHeaders(std::string& result, const HttpResponse& response, size_t contentLength) {
+    if (!response.getContentType().empty()) {
+        result += "Content-Type: " + response.getContentType() + "\r\n";
+    }
+
+    result += "Server: CppHttpServer/1.0\r\n";
+
+    for (const auto& header : response.getHeaders()) {
+        if (header.first == "Connection" || header.first == "Content-Type" || header.first == "Content-Length") {
+            continue;
+        }
+        result += header.first + ": " + header.second + "\r\n";
+    }
+
+    result += "Content-Length: " + std::to_string(contentLength) + "\r\n";
+
+    std::string connectionValue = response.getHeader("Connection");
+    if (connectionValue.empty()) {
+        connectionValue = "Close";
+    }
+    result += "Connection: " + connectionValue + "\r\n";
+}
+
+} // namespace
+
 /**
  * @brief 构造函数
  * 
@@ -81,6 +108,7 @@ std::string HttpResponse::getStatusMessage() const {
  */
 void HttpResponse::setContentType(const std::string& contentType) {
     m_contentType = contentType;
+    m_headers["Content-Type"] = contentType;
 }
 
 /**
@@ -101,6 +129,11 @@ std::string HttpResponse::getContentType() const {
  * @param value 头部字段值
  */
 void HttpResponse::addHeader(const std::string& key, const std::string& value) {
+    if (key == "Content-Type") {
+        setContentType(value);
+        return;
+    }
+
     m_headers[key] = value;
 }
 
@@ -227,37 +260,9 @@ std::string HttpResponse::toString() const {
     // 将枚举类型转换为整数后再转换为字符串
     result = "HTTP/1.1 " + std::to_string(static_cast<int>(m_statusCode)) + " " + m_statusMessage + "\r\n";
 
-    // 2. Content-Type头部
-    if (!m_contentType.empty()) {
-        result += "Content-Type: " + m_contentType + "\r\n";
-    }
+    appendSerializedHeaders(result, *this, getBodySize());
 
-    // 3. Server头部
-    result += "Server: CppHttpServer/1.0\r\n";
-
-    // 4. 其他自定义头部（Connection 统一在后面输出，避免重复）
-    for (const auto& header : m_headers) {
-        if (header.first == "Connection") {
-            continue;
-        }
-        result += header.first + ": " + header.second + "\r\n";
-    }
-
-    // 5. Content-Length头部（无论响应体是在内存中还是文件中）
-    // 必须始终添加 Content-Length，即使文件不存在也能让客户端知道响应体大小
-    size_t bodySize = getBodySize();
-    if (bodySize > 0 || !m_filePath.empty()) {
-        result += "Content-Length: " + std::to_string(bodySize) + "\r\n";
-    }
-
-    // 6. Connection头部：优先使用已设置值，否则默认Close
-    std::string connectionValue = getHeader("Connection");
-    if (connectionValue.empty()) {
-        connectionValue = "Close";
-    }
-    result += "Connection: " + connectionValue + "\r\n";
-
-    // 7. 空行，标志头部结束
+    // 2. 空行，标志头部结束
     result += "\r\n";
 
     // 注意：实际的响应体数据（文件内容）不在这里包含
@@ -281,35 +286,9 @@ std::string HttpResponse::buildHeaderString(size_t contentLength) const {
     // 1. 状态行
     result = "HTTP/1.1 " + std::to_string(static_cast<int>(m_statusCode)) + " " + m_statusMessage + "\r\n";
 
-    // 2. Content-Type头部
-    if (!m_contentType.empty()) {
-        result += "Content-Type: " + m_contentType + "\r\n";
-    }
+    appendSerializedHeaders(result, *this, contentLength);
 
-    // 3. Server头部
-    result += "Server: CppHttpServer/1.0\r\n";
-
-    // 4. 其他自定义头部（Connection 统一在后面输出，避免重复）
-    for (const auto& header : m_headers) {
-        if (header.first == "Connection") {
-            continue;
-        }
-        result += header.first + ": " + header.second + "\r\n";
-    }
-
-    // 5. Content-Length头部（使用传入的参数）
-    if (contentLength > 0) {
-        result += "Content-Length: " + std::to_string(contentLength) + "\r\n";
-    }
-
-    // 6. Connection头部：优先使用已设置值，否则默认Close
-    std::string connectionValue = getHeader("Connection");
-    if (connectionValue.empty()) {
-        connectionValue = "Close";
-    }
-    result += "Connection: " + connectionValue + "\r\n";
-
-    // 7. 空行
+    // 2. 空行
     result += "\r\n";
 
     return result;
@@ -348,6 +327,73 @@ std::string HttpResponse::statusCodeToString(StatusCode code) {
         case STATUS_505_HTTP_VERSION_NOT_SUPPORTED: return "HTTP Version Not Supported";
         default: return "Unknown";
     }
+}
+
+/**
+ * @brief 转义JSON字符串
+ * 
+ * 将普通文本转义为可安全放入JSON字符串字面量中的内容。
+ * 
+ * @param text 原始文本
+ * @return std::string JSON转义后的字符串内容（不含外层引号）
+ */
+std::string HttpResponse::escapeJsonString(const std::string& text) {
+    std::string escaped;
+    escaped.reserve(text.length());
+
+    for (char ch : text) {
+        switch (ch) {
+            case '\\': escaped += "\\\\"; break;
+            case '"': escaped += "\\\""; break;
+            case '\b': escaped += "\\b"; break;
+            case '\f': escaped += "\\f"; break;
+            case '\n': escaped += "\\n"; break;
+            case '\r': escaped += "\\r"; break;
+            case '\t': escaped += "\\t"; break;
+            default:
+                escaped.push_back(ch);
+                break;
+        }
+    }
+
+    return escaped;
+}
+
+/**
+ * @brief 创建JSON响应
+ * 
+ * 自动设置JSON Content-Type，并写入指定JSON文本作为响应体。
+ * 
+ * @param code 状态码
+ * @param jsonBody 已构造好的JSON文本
+ * @return HttpResponse JSON响应对象
+ */
+HttpResponse HttpResponse::jsonResponse(StatusCode code, const std::string& jsonBody) {
+    HttpResponse response;
+    response.setStatusCode(code);
+    response.setContentType("application/json; charset=utf-8");
+    response.setBody(jsonBody);
+    return response;
+}
+
+/**
+ * @brief 创建JSON错误响应
+ * 
+ * 生成统一的JSON错误包裹格式。
+ * 
+ * @param code 状态码
+ * @param message 错误消息
+ * @return HttpResponse JSON错误响应对象
+ */
+HttpResponse HttpResponse::jsonError(StatusCode code, const std::string& message) {
+    std::string json = "{\n";
+    json += "  \"error\": {\n";
+    json += "    \"code\": " + std::to_string(static_cast<int>(code)) + ",\n";
+    json += "    \"message\": \"" + escapeJsonString(message) + "\"\n";
+    json += "  }\n";
+    json += "}";
+
+    return jsonResponse(code, json);
 }
 
 /**
@@ -441,9 +487,22 @@ HttpResponse HttpResponse::notFound() {
  * @return HttpResponse 预配置的405错误响应对象
  */
 HttpResponse HttpResponse::methodNotAllowed() {
+    return methodNotAllowed("");
+}
+
+/**
+ * @brief 创建405 Method Not Allowed响应
+ * 
+ * @param allowMethods Allow头部值，例如"GET, HEAD"
+ * @return HttpResponse 预配置的405错误响应对象
+ */
+HttpResponse HttpResponse::methodNotAllowed(const std::string& allowMethods) {
     HttpResponse response;
     response.setStatusCode(STATUS_405_METHOD_NOT_ALLOWED);
     response.setContentType("text/html; charset=utf-8");
+    if (!allowMethods.empty()) {
+        response.addHeader("Allow", allowMethods);
+    }
     response.setBody("<html><head><title>405 Method Not Allowed</title></head>"
                      "<body><center><h1>405 Method Not Allowed</h1></center></body></html>");
     return response;
