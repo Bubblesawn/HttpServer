@@ -586,13 +586,27 @@ bool HttpServer::matchRoutePattern(const std::string& pattern,
     return true;
 }
 
+bool HttpServer::matchRouteParams(const HttpRequest& request,
+                                  const std::map<std::string, std::string>& requiredParams) const {
+    for (const auto& requiredParam : requiredParams) {
+        if (request.getParameter(requiredParam.first) != requiredParam.second) {
+            return false;
+        }
+    }
+
+    return true;
+}
+
 std::string HttpServer::getAllowedMethodsForPath(const std::string& path) const {
     std::vector<std::string> methods;
     for (const auto& pair : m_routeHandlers) {
         const std::string suffix = " " + path;
         if (pair.first.size() > suffix.size() &&
             pair.first.compare(pair.first.size() - suffix.size(), suffix.size(), suffix) == 0) {
-            methods.push_back(pair.first.substr(0, pair.first.size() - suffix.size()));
+            const std::string method = pair.first.substr(0, pair.first.size() - suffix.size());
+            for (size_t index = 0; index < pair.second.size(); ++index) {
+                methods.push_back(method);
+            }
         }
     }
 
@@ -628,12 +642,18 @@ std::string HttpServer::getAllowedMethodsForPath(const std::string& path) const 
     return allow.str();
 }
 
-void HttpServer::registerRoute(HttpRequest::Method method, const std::string& path, RequestHandler handler) {
-    m_routeHandlers[buildRouteKey(method, path)] = std::move(handler);
+void HttpServer::registerRoute(HttpRequest::Method method,
+                               const std::string& path,
+                               RequestHandler handler,
+                               const std::map<std::string, std::string>& requiredParams) {
+    m_routeHandlers[buildRouteKey(method, path)].push_back({std::move(handler), requiredParams});
 }
 
-void HttpServer::registerRoutePattern(HttpRequest::Method method, const std::string& pathPattern, RequestHandler handler) {
-    m_routePatterns.push_back({method, pathPattern, std::move(handler)});
+void HttpServer::registerRoutePattern(HttpRequest::Method method,
+                                      const std::string& pathPattern,
+                                      RequestHandler handler,
+                                      const std::map<std::string, std::string>& requiredParams) {
+    m_routePatterns.push_back({method, pathPattern, std::move(handler), requiredParams});
 }
 
 void HttpServer::registerDefaultRoutes() {
@@ -668,28 +688,66 @@ void HttpServer::registerDefaultRoutes() {
 bool HttpServer::dispatchRoute(const HttpRequest& request, HttpResponse& response) const {
     const std::string routeKey = buildRouteKey(request.getMethod(), request.getPath());
     const auto it = m_routeHandlers.find(routeKey);
-    if (it == m_routeHandlers.end()) {
-        for (const auto& routePattern : m_routePatterns) {
-            if (routePattern.method != request.getMethod()) {
+    if (it != m_routeHandlers.end()) {
+        size_t bestMatchSpecificity = 0;
+        bool matched = false;
+
+        for (const auto& routeEntry : it->second) {
+            if (!matchRouteParams(request, routeEntry.requiredParams)) {
                 continue;
             }
 
-            std::map<std::string, std::string> pathParams;
-            if (!matchRoutePattern(routePattern.pattern, request.getPath(), pathParams)) {
+            const size_t specificity = routeEntry.requiredParams.size();
+            if (matched && specificity <= bestMatchSpecificity) {
                 continue;
             }
 
-            HttpRequest routedRequest = request;
-            routedRequest.setPathParams(pathParams);
-            response = routePattern.handler(routedRequest);
-            return true;
+            response = routeEntry.handler(request);
+            bestMatchSpecificity = specificity;
+            matched = true;
         }
 
-        return false;
+        if (matched) {
+            return true;
+        }
     }
 
-    response = it->second(request);
-    return true;
+    size_t bestMatchSpecificity = 0;
+    bool matched = false;
+    HttpResponse bestResponse;
+
+    for (const auto& routePattern : m_routePatterns) {
+        if (routePattern.method != request.getMethod()) {
+            continue;
+        }
+
+        std::map<std::string, std::string> pathParams;
+        if (!matchRoutePattern(routePattern.pattern, request.getPath(), pathParams)) {
+            continue;
+        }
+
+        if (!matchRouteParams(request, routePattern.requiredParams)) {
+            continue;
+        }
+
+        HttpRequest routedRequest = request;
+        routedRequest.setPathParams(pathParams);
+        const size_t specificity = routePattern.requiredParams.size();
+        if (matched && specificity <= bestMatchSpecificity) {
+            continue;
+        }
+
+        bestResponse = routePattern.handler(routedRequest);
+        bestMatchSpecificity = specificity;
+        matched = true;
+    }
+
+    if (matched) {
+        response = std::move(bestResponse);
+        return true;
+    }
+
+    return false;
 }
 
 void HttpServer::runMiddlewareChain(size_t index,

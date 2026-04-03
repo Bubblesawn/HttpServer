@@ -199,6 +199,58 @@ void testHttpServerRoutePatterns() {
     expectTrue(response.getHeader("X-Content-Type-Options") == "nosniff", "middleware should attach security header");
 }
 
+void testHttpServerRouteParameterMatching() {
+    HttpServer server;
+    server.registerRoute(HttpRequest::METHOD_GET,
+                         "/search",
+                         [](const HttpRequest&) {
+                             HttpResponse response;
+                             response.setStatusCode(HttpResponse::STATUS_200_OK);
+                             response.setBody("book");
+                             return response;
+                         },
+                         {{"type", "book"}});
+    server.registerRoute(HttpRequest::METHOD_GET,
+                         "/search",
+                         [](const HttpRequest&) {
+                             HttpResponse response;
+                             response.setStatusCode(HttpResponse::STATUS_200_OK);
+                             response.setBody("user");
+                             return response;
+                         },
+                         {{"type", "user"}});
+    server.registerRoutePattern(HttpRequest::METHOD_GET,
+                                "/users/{id}",
+                                [](const HttpRequest& request) {
+                                    HttpResponse response;
+                                    response.setStatusCode(HttpResponse::STATUS_200_OK);
+                                    response.setBody(request.getPathParam("id") + ":" + request.getParameter("format"));
+                                    return response;
+                                },
+                                {{"format", "json"}});
+
+    HttpRequest searchRequest;
+    searchRequest.setMethodString("GET");
+    searchRequest.setUrl("/search?type=user");
+    searchRequest.setVersion("HTTP/1.1");
+
+    const HttpResponse searchResponse = server.handleRequest(searchRequest);
+    expectTrue(searchResponse.getStatusCode() == HttpResponse::STATUS_200_OK,
+               "parameter-matched route should return 200");
+    expectEqual(searchResponse.getBody(), "user", "route should select the handler matching request parameters");
+
+    HttpRequest patternRequest;
+    patternRequest.setMethodString("GET");
+    patternRequest.setUrl("/users/42?format=json");
+    patternRequest.setVersion("HTTP/1.1");
+
+    const HttpResponse patternResponse = server.handleRequest(patternRequest);
+    expectTrue(patternResponse.getStatusCode() == HttpResponse::STATUS_200_OK,
+               "pattern route with parameter constraint should return 200");
+    expectEqual(patternResponse.getBody(), "42:json",
+                "pattern route should expose path parameters and match request parameters");
+}
+
 void testHttpServerOptionsAndAllowHeader() {
     HttpServer server;
 
@@ -236,6 +288,7 @@ int main() {
     testHttpResponseFileBodySize();
     testHttpResponseErrorFactories();
     testHttpServerRoutePatterns();
+    testHttpServerRouteParameterMatching();
     testHttpServerOptionsAndAllowHeader();
 
     if (g_failed != 0) {

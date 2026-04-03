@@ -282,7 +282,18 @@ public:
      * @param pathPattern 路由模式
      * @param handler 处理函数
      */
-    void registerRoutePattern(HttpRequest::Method method, const std::string& pathPattern, RequestHandler handler);
+    void registerRoutePattern(HttpRequest::Method method,
+                              const std::string& pathPattern,
+                              RequestHandler handler,
+                              const std::map<std::string, std::string>& requiredParams = {});
+
+    /**
+     * @brief 注册单个路由
+     */
+    void registerRoute(HttpRequest::Method method,
+                       const std::string& path,
+                       RequestHandler handler,
+                       const std::map<std::string, std::string>& requiredParams = {});
 
     /**
      * @brief 处理一个已经解析好的请求
@@ -304,12 +315,18 @@ public:
     std::string getLocalIp() const;
 
 private:
-    using RouteTable = std::unordered_map<std::string, RequestHandler>;
+    struct RouteEntry {
+        RequestHandler handler;
+        std::map<std::string, std::string> requiredParams;
+    };
+
+    using RouteTable = std::unordered_map<std::string, std::vector<RouteEntry>>;
 
     struct RoutePattern {
         HttpRequest::Method method;
         std::string pattern;
         RequestHandler handler;
+        std::map<std::string, std::string> requiredParams;
     };
 
     /**
@@ -347,11 +364,6 @@ private:
      * @brief 注册默认路由
      */
     void registerDefaultRoutes();
-
-    /**
-     * @brief 注册单个路由
-     */
-    void registerRoute(HttpRequest::Method method, const std::string& path, RequestHandler handler);
 
     /**
      * @brief 执行请求处理中间件链
@@ -395,6 +407,11 @@ private:
     bool matchRoutePattern(const std::string& pattern,
                            const std::string& path,
                            std::map<std::string, std::string>& pathParams) const;
+
+    /**
+     * @brief 判断请求参数是否满足路由条件
+     */
+    bool matchRouteParams(const HttpRequest& request, const std::map<std::string, std::string>& requiredParams) const;
 
     /**
      * @brief 处理客户端请求
