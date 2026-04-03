@@ -30,6 +30,8 @@
 #include <cerrno>           // 错误处理
 #include <fstream>           // 文件流
 #include <sstream>           // 字符串流
+#include <iomanip>           // 日期格式化
+#include <ctime>             // 时间处理
 #include <algorithm>         // 算法
 #include <cctype>           // 字符处理
 #include <limits>           // 数值边界
@@ -45,9 +47,31 @@
 #endif
 
 namespace {
+/**
+ * @brief 保护按 socket 复用的跨请求读取缓冲区。
+ *
+ * 该互斥量用于同步访问 g_socketReadBuffers，避免在多线程处理并发连接时
+ * 出现同一文件描述符的读缓冲被并发修改。
+ */
 std::mutex g_readBufferMutex;
+
+/**
+ * @brief 按 socket 保存的增量读取缓冲区。
+ *
+ * 当 HTTP 请求在边缘触发模式下被分段读取时，服务器会把未消费完的字节
+ * 保存在这里，下一次读取同一连接时继续拼接解析。
+ */
 std::unordered_map<int, std::string> g_socketReadBuffers;
 
+/**
+ * @brief 生成输入字符串的小写副本。
+ *
+ * 该工具函数主要用于对 HTTP 头部名和头部值做大小写不敏感判断，避免修改
+ * 原始字符串。
+ *
+ * @param input 原始字符串
+ * @return std::string 小写化后的拷贝
+ */
 std::string toLowerCopy(const std::string& input) {
     std::string output = input;
     std::transform(output.begin(), output.end(), output.begin(), [](unsigned char ch) {
@@ -56,6 +80,14 @@ std::string toLowerCopy(const std::string& input) {
     return output;
 }
 
+/**
+ * @brief 将 URL 路径按 '/' 分割为段列表。
+ *
+ * 该函数会忽略连续斜杠和空段，适合用于路由模式匹配和路径规范化判断。
+ *
+ * @param path 原始路径
+ * @return std::vector<std::string> 分段后的路径组件
+ */
 std::vector<std::string> splitPathSegments(const std::string& path) {
     std::vector<std::string> segments;
     size_t start = 0;
@@ -80,6 +112,19 @@ std::vector<std::string> splitPathSegments(const std::string& path) {
     return segments;
 }
 
+/**
+ * @brief 判断请求是否倾向于 JSON 响应。
+ *
+ * 判定依据按优先级依次为：
+ * - Accept 头包含 application/json
+ * - Content-Type 头为 JSON 相关媒体类型
+ * - 路径以前缀 /api/ 开头
+ *
+ * 该逻辑用于统一错误响应的返回格式，保证 API 路径优先返回 JSON。
+ *
+ * @param request HTTP 请求对象
+ * @return bool 如果应返回 JSON 则为 true
+ */
 bool containsJsonAcceptHeader(const HttpRequest& request) {
     const std::string accept = toLowerCopy(request.getHeader("Accept"));
     if (accept.find("application/json") != std::string::npos) {
@@ -95,6 +140,15 @@ bool containsJsonAcceptHeader(const HttpRequest& request) {
     return request.getPath().rfind("/api/", 0) == 0;
 }
 
+/**
+ * @brief 将字符串值转换为 JSON 值。
+ *
+ * 如果输入已经是合法 JSON 文本，则按 JSON 结构解析；否则将其作为字符串值
+ * 返回，避免把普通文本错误地包装成 JSON 对象。
+ *
+ * @param value 原始字符串
+ * @return nlohmann::json 对应的 JSON 值
+ */
 nlohmann::json valueToJson(const std::string& value) {
     const auto parsed = nlohmann::json::parse(value, nullptr, false);
     if (!parsed.is_discarded()) {
@@ -104,6 +158,14 @@ nlohmann::json valueToJson(const std::string& value) {
     return value;
 }
 
+/**
+ * @brief 将字符串键值对映射转换为 JSON 对象。
+ *
+ * 所有值都按字符串原样写入，适合用于查询参数、表单参数和调试型回显。
+ *
+ * @param values 输入键值对
+ * @return nlohmann::json JSON 对象
+ */
 nlohmann::json mapToJsonObject(const std::map<std::string, std::string>& values) {
     nlohmann::json object = nlohmann::json::object();
     for (const auto& pair : values) {
@@ -112,6 +174,15 @@ nlohmann::json mapToJsonObject(const std::map<std::string, std::string>& values)
     return object;
 }
 
+/**
+ * @brief 将字符串键值对映射转换为 JSON 对象，并尝试解析字段值。
+ *
+ * 该函数会对每个 value 调用 valueToJson，以便数字、布尔值和嵌套 JSON 能够
+ * 以结构化形式保留。
+ *
+ * @param values 输入键值对
+ * @return nlohmann::json JSON 对象
+ */
 nlohmann::json parsedValueMapToJsonObject(const std::map<std::string, std::string>& values) {
     nlohmann::json object = nlohmann::json::object();
     for (const auto& pair : values) {
@@ -120,12 +191,27 @@ nlohmann::json parsedValueMapToJsonObject(const std::map<std::string, std::strin
     return object;
 }
 
+/**
+ * @brief 单段 Range 解析结果。
+ *
+ * NOT_PRESENT 表示请求没有提供 Range 头；
+ * VALID 表示 Range 语法正确并可应用；
+ * INVALID 表示请求头存在但格式或边界不合法。
+ */
 enum class RangeParseResult {
     NOT_PRESENT,
     VALID,
     INVALID
 };
 
+/**
+ * @brief 去除字符串首尾空白字符。
+ *
+ * 主要用于解析 HTTP 头部值和 Range 片段，确保额外空格不会影响判断。
+ *
+ * @param input 原始字符串
+ * @return std::string 去空白后的结果
+ */
 std::string trimWhitespace(const std::string& input) {
     const size_t start = input.find_first_not_of(" \t");
     if (start == std::string::npos) {
@@ -135,6 +221,23 @@ std::string trimWhitespace(const std::string& input) {
     return input.substr(start, end - start + 1);
 }
 
+/**
+ * @brief 解析单段 HTTP Range 请求头。
+ *
+ * 支持以下语法：
+ * - bytes=start-end
+ * - bytes=start-
+ * - bytes=-suffixLength
+ *
+ * 该函数只处理单段范围。遇到多段范围、非法前缀或越界值时返回 INVALID；
+ * 请求未携带 Range 头时返回 NOT_PRESENT。
+ *
+ * @param rangeHeader 原始 Range 头值
+ * @param fileSize 文件总大小，用于边界裁剪
+ * @param rangeStart 解析出的起始字节
+ * @param rangeEnd 解析出的结束字节
+ * @return RangeParseResult 解析结果
+ */
 RangeParseResult parseSingleRangeHeader(const std::string& rangeHeader,
                                         off_t fileSize,
                                         off_t& rangeStart,
@@ -223,16 +326,187 @@ RangeParseResult parseSingleRangeHeader(const std::string& rangeHeader,
     }
 }
 
+/**
+ * @brief 删除某个 socket 的残留读取缓冲。
+ *
+ * 当连接关闭或请求处理完成后调用，避免旧数据在连接重用时污染后续解析。
+ *
+ * @param fd socket 文件描述符
+ */
 void clearSocketReadBuffer(int fd) {
     std::lock_guard<std::mutex> lock(g_readBufferMutex);
     g_socketReadBuffers.erase(fd);
 }
 
+/**
+ * @brief 将响应转换为 HEAD 语义。
+ *
+ * 保留响应的状态码和头部信息，仅清空正文和文件路径，确保响应头中的
+ * Content-Length 与最终发送行为一致。
+ *
+ * @param response 待调整的响应对象
+ */
 void stripResponseBodyForHead(HttpResponse& response) {
     const std::string contentType = response.getContentType();
     response.setBody("");
     response.setFilePath("");
     response.setContentType(contentType);
+}
+
+/**
+ * @brief 将时间戳格式化为 HTTP 日期字符串。
+ *
+ * 输出格式符合 RFC 9110 的 IMF-fixdate 形式，例如：
+ * Mon, 02 Jan 2006 15:04:05 GMT
+ *
+ * @param value UTC 时间戳
+ * @return std::string HTTP 日期字符串
+ */
+std::string formatHttpDate(time_t value) {
+    std::tm gmTime{};
+    gmtime_r(&value, &gmTime);
+
+    std::ostringstream output;
+    output.imbue(std::locale::classic());
+    output << std::put_time(&gmTime, "%a, %d %b %Y %H:%M:%S GMT");
+    return output.str();
+}
+
+/**
+ * @brief 解析 HTTP 日期字符串。
+ *
+ * 目前支持与 formatHttpDate 对称的 IMF-fixdate 格式，失败时返回 false。
+ *
+ * @param value HTTP 日期字符串
+ * @param parsedTime 解析后的 UTC 时间戳
+ * @return bool 解析成功返回 true
+ */
+bool parseHttpDate(const std::string& value, time_t& parsedTime) {
+    std::tm tm{};
+    std::istringstream input(value);
+    input.imbue(std::locale::classic());
+    input >> std::get_time(&tm, "%a, %d %b %Y %H:%M:%S GMT");
+    if (input.fail()) {
+        return false;
+    }
+
+    tm.tm_isdst = 0;
+    const time_t converted = timegm(&tm);
+    if (converted < 0) {
+        return false;
+    }
+
+    parsedTime = converted;
+    return true;
+}
+
+/**
+ * @brief 去除实体标签的弱标签前缀与包裹引号。
+ *
+ * 用于比较 If-None-Match 中的 ETag 值时统一格式，兼容 W/"etag"、"etag"
+ * 和裸值写法。
+ *
+ * @param value 原始实体标签值
+ * @return std::string 规范化后的标签内容
+ */
+std::string trimCopy(const std::string& value) {
+    const size_t start = value.find_first_not_of(" \t");
+    if (start == std::string::npos) {
+        return "";
+    }
+
+    const size_t end = value.find_last_not_of(" \t");
+    return value.substr(start, end - start + 1);
+}
+
+std::string normalizeEntityTag(const std::string& value) {
+    std::string normalized = trimCopy(value);
+    if (normalized.size() >= 2 && (normalized[0] == 'W' || normalized[0] == 'w') && normalized[1] == '/') {
+        normalized = trimCopy(normalized.substr(2));
+    }
+
+    if (normalized.size() >= 2 && normalized.front() == '"' && normalized.back() == '"') {
+        normalized = normalized.substr(1, normalized.size() - 2);
+    }
+
+    return normalized;
+}
+
+/**
+ * @brief 构造静态文件的实体标签。
+ *
+ * 当前实现基于 inode、文件大小和修改时间生成稳定的弱校验值，用于缓存验证。
+ *
+ * @param fileStat 文件状态信息
+ * @return std::string ETag 字符串
+ */
+std::string buildStaticFileEtag(const struct stat& fileStat) {
+    std::ostringstream output;
+    output << '"' << std::hex << static_cast<unsigned long long>(fileStat.st_ino) << '-'
+           << static_cast<unsigned long long>(fileStat.st_size) << '-'
+           << static_cast<unsigned long long>(fileStat.st_mtime) << '"';
+    return output.str();
+}
+
+/**
+ * @brief 判断 If-None-Match 是否命中当前 ETag。
+ *
+ * 支持逗号分隔的多个实体标签以及通配符 *。
+ *
+ * @param headerValue If-None-Match 头部值
+ * @param currentEtag 当前资源的 ETag
+ * @return bool 如果命中则返回 true
+ */
+bool matchesIfNoneMatch(const std::string& headerValue, const std::string& currentEtag) {
+    const std::string normalizedCurrent = normalizeEntityTag(currentEtag);
+    if (normalizedCurrent.empty()) {
+        return false;
+    }
+
+    const std::string trimmedHeader = trimCopy(headerValue);
+    if (trimmedHeader == "*") {
+        return true;
+    }
+
+    std::istringstream input(headerValue);
+    std::string token;
+    while (std::getline(input, token, ',')) {
+        if (normalizeEntityTag(token) == normalizedCurrent) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+/**
+ * @brief 判断请求是否满足缓存未修改条件。
+ *
+ * 先检查 If-None-Match，再回退到 If-Modified-Since。只要任一条件命中，就可以
+ * 返回 304 Not Modified。
+ *
+ * @param request HTTP 请求对象
+ * @param fileStat 文件状态信息
+ * @param etag 当前资源的 ETag
+ * @return bool 如果可以返回 304 则返回 true
+ */
+bool isConditionalNotModified(const HttpRequest& request,
+                              const struct stat& fileStat,
+                              const std::string& etag) {
+    const std::string ifNoneMatch = request.getHeader("If-None-Match");
+    if (!ifNoneMatch.empty()) {
+        return matchesIfNoneMatch(ifNoneMatch, etag);
+    }
+
+    const std::string ifModifiedSince = request.getHeader("If-Modified-Since");
+    if (!ifModifiedSince.empty()) {
+        time_t parsedTime = 0;
+        if (parseHttpDate(ifModifiedSince, parsedTime)) {
+            return parsedTime >= fileStat.st_mtime;
+        }
+    }
+
+    return false;
 }
 } // namespace
 
@@ -781,7 +1055,8 @@ void HttpServer::processRequest(HttpRequest& request, HttpResponse& response) co
             generatedResponse.setStatusCode(HttpResponse::STATUS_204_NO_CONTENT);
             generatedResponse.addHeader("Allow", getAllowedMethodsForPath(request.getPath()));
             generatedResponse.setBody("");
-        } else if (request.getMethod() == HttpRequest::METHOD_PUT ||
+        } else if (request.getMethod() == HttpRequest::METHOD_PATCH ||
+               request.getMethod() == HttpRequest::METHOD_PUT ||
                    request.getMethod() == HttpRequest::METHOD_DELETE) {
             generatedResponse = buildUnifiedErrorResponse(request,
                                                           HttpResponse::STATUS_405_METHOD_NOT_ALLOWED,
@@ -1068,11 +1343,16 @@ void HttpServer::cleanupClient(int clientSocket) {
 /**
  * @brief 处理客户端请求
  *
- * 完整的请求处理流程：
- * 1. 解析HTTP请求
- * 2. 调用处理函数生成响应
- * 3. 发送响应头
- * 4. 发送响应体（文件或内存内容）
+ * 根据请求路径查找对应的文件，并生成HTTP响应。
+ * 该流程负责静态资源的完整协商与回退，包括：
+ * - 路径遍历检查与 URL 解码后的二次校验
+ * - 目录请求自动解析 index.html
+ * - 目录无索引页时返回目录列表
+ * - 生成 ETag 和 Last-Modified，用于缓存验证
+ * - 处理 If-None-Match / If-Modified-Since 并返回 304
+ * - 支持单段 Range 请求并返回 206 / 416
+ *
+ * 这是静态文件链路的核心入口，既承担资源发现，也承担协议协商。
  * 5. 关闭客户端连接
  *
  * @param clientSocket 客户端socket描述符
@@ -1276,7 +1556,10 @@ bool HttpServer::handleClient(int clientSocket, const std::string& clientIp, int
         keepAlive = false;  // 发送失败，关闭连接
     }
 
-    const bool shouldSendBody = !(parseSuccess && request.getMethod() == HttpRequest::METHOD_HEAD);
+    const bool shouldSendBody = !(parseSuccess &&
+                                  (request.getMethod() == HttpRequest::METHOD_HEAD ||
+                                   response.getStatusCode() == HttpResponse::STATUS_204_NO_CONTENT ||
+                                   response.getStatusCode() == HttpResponse::STATUS_304_NOT_MODIFIED));
 
     if (shouldSendBody && useSendfile && fileFd >= 0) {
         // 使用sendfile零拷贝发送文件内容，性能更优
@@ -1460,10 +1743,29 @@ HttpResponse HttpServer::handleStaticFile(const HttpRequest& request) const {
         }
     }
 
+    if (!S_ISREG(st.st_mode)) {
+        return HttpResponse::notFound();
+    }
+
+    const std::string etag = buildStaticFileEtag(st);
+    const std::string lastModified = formatHttpDate(st.st_mtime);
+
+    if (isConditionalNotModified(request, st, etag)) {
+        HttpResponse response;
+        response.setStatusCode(HttpResponse::STATUS_304_NOT_MODIFIED);
+        response.addHeader("ETag", etag);
+        response.addHeader("Last-Modified", lastModified);
+        response.addHeader("Accept-Ranges", "bytes");
+        return response;
+    }
+
     // 创建成功响应
     HttpResponse response;
     response.setStatusCode(HttpResponse::STATUS_200_OK);
     response.setFilePath(filePath);  // 设置文件路径，响应类会自动识别Content-Type
+    response.addHeader("ETag", etag);
+    response.addHeader("Last-Modified", lastModified);
+    response.addHeader("Accept-Ranges", "bytes");
 
     return response;
 }

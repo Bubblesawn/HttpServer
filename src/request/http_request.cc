@@ -320,6 +320,7 @@ HttpRequest::Method HttpRequest::stringToMethod(const std::string& method) {
     if (strcasecmp(method.c_str(), "GET") == 0) return METHOD_GET;
     if (strcasecmp(method.c_str(), "OPTIONS") == 0) return METHOD_OPTIONS;
     if (strcasecmp(method.c_str(), "POST") == 0) return METHOD_POST;
+    if (strcasecmp(method.c_str(), "PATCH") == 0) return METHOD_PATCH;
     if (strcasecmp(method.c_str(), "PUT") == 0) return METHOD_PUT;
     if (strcasecmp(method.c_str(), "DELETE") == 0) return METHOD_DELETE;
     if (strcasecmp(method.c_str(), "HEAD") == 0) return METHOD_HEAD;
@@ -340,6 +341,7 @@ std::string HttpRequest::methodToString(Method method) {
         case METHOD_GET:    return "GET";
         case METHOD_OPTIONS:return "OPTIONS";
         case METHOD_POST:   return "POST";
+        case METHOD_PATCH:  return "PATCH";
         case METHOD_PUT:    return "PUT";
         case METHOD_DELETE: return "DELETE";
         case METHOD_HEAD:   return "HEAD";

@@ -72,6 +72,14 @@ void testHttpRequestParsing() {
     expectEqual(request.getParameter("name"), "alice smith", "unified parameter lookup should read form body values");
 }
 
+void testHttpRequestPatchMethodParsing() {
+    HttpRequest request;
+    request.setMethodString("patch");
+
+    expectTrue(request.getMethod() == HttpRequest::METHOD_PATCH, "method string should map to PATCH");
+    expectEqual(HttpRequest::methodToString(HttpRequest::METHOD_PATCH), "PATCH", "PATCH should stringify correctly");
+}
+
 void testHttpRequestJsonParsing() {
     HttpRequest request;
     request.setMethodString("post");
@@ -199,6 +207,85 @@ void testHttpServerRoutePatterns() {
     expectTrue(response.getHeader("X-Content-Type-Options") == "nosniff", "middleware should attach security header");
 }
 
+void testHttpServerStaticFileValidationHeaders() {
+    const std::filesystem::path tempDir = std::filesystem::temp_directory_path() / "http_server_http11_test";
+    std::filesystem::create_directories(tempDir);
+
+    const std::filesystem::path tempFile = tempDir / "asset.txt";
+    {
+        std::ofstream output(tempFile, std::ios::binary);
+        output << "abcdef";
+    }
+
+    HttpServer server;
+    server.setDocRoot(tempDir.string());
+
+    HttpRequest request;
+    request.setMethodString("GET");
+    request.setUrl("/asset.txt");
+    request.setVersion("HTTP/1.1");
+
+    const HttpResponse response = server.handleRequest(request);
+    const std::string etag = response.getHeader("ETag");
+    const std::string lastModified = response.getHeader("Last-Modified");
+
+    expectTrue(response.getStatusCode() == HttpResponse::STATUS_200_OK, "static file should return 200");
+    expectTrue(!etag.empty(), "static file should include ETag");
+    expectTrue(!lastModified.empty(), "static file should include Last-Modified");
+    expectTrue(response.getHeader("Accept-Ranges") == "bytes", "static file should advertise byte ranges");
+
+    HttpRequest ifNoneMatchRequest;
+    ifNoneMatchRequest.setMethodString("GET");
+    ifNoneMatchRequest.setUrl("/asset.txt");
+    ifNoneMatchRequest.setVersion("HTTP/1.1");
+    ifNoneMatchRequest.addHeader("If-None-Match", etag);
+
+    const HttpResponse notModifiedByEtag = server.handleRequest(ifNoneMatchRequest);
+    expectTrue(notModifiedByEtag.getStatusCode() == HttpResponse::STATUS_304_NOT_MODIFIED,
+               "matching ETag should return 304");
+
+    HttpRequest ifModifiedSinceRequest;
+    ifModifiedSinceRequest.setMethodString("GET");
+    ifModifiedSinceRequest.setUrl("/asset.txt");
+    ifModifiedSinceRequest.setVersion("HTTP/1.1");
+    ifModifiedSinceRequest.addHeader("If-Modified-Since", lastModified);
+
+    const HttpResponse notModifiedByDate = server.handleRequest(ifModifiedSinceRequest);
+    expectTrue(notModifiedByDate.getStatusCode() == HttpResponse::STATUS_304_NOT_MODIFIED,
+               "matching Last-Modified should return 304");
+
+    std::filesystem::remove(tempFile);
+    std::filesystem::remove(tempDir);
+}
+
+void testHttpServerPatchMethodRouting() {
+    HttpServer server;
+    server.registerRoute(HttpRequest::METHOD_PATCH, "/api/items", [](const HttpRequest&) {
+        HttpResponse response;
+        response.setStatusCode(HttpResponse::STATUS_200_OK);
+        response.setBody("patched");
+        return response;
+    });
+
+    HttpRequest routedRequest;
+    routedRequest.setMethodString("PATCH");
+    routedRequest.setUrl("/api/items");
+    routedRequest.setVersion("HTTP/1.1");
+
+    const HttpResponse routedResponse = server.handleRequest(routedRequest);
+    expectTrue(routedResponse.getStatusCode() == HttpResponse::STATUS_200_OK, "PATCH route should be dispatched");
+    expectEqual(routedResponse.getBody(), "patched", "PATCH route should execute registered handler");
+
+    HttpRequest unsupportedPatch;
+    unsupportedPatch.setMethodString("PATCH");
+    unsupportedPatch.setUrl("/health");
+    unsupportedPatch.setVersion("HTTP/1.1");
+
+    const HttpResponse unsupportedResponse = server.handleRequest(unsupportedPatch);
+    expectTrue(unsupportedResponse.getStatusCode() == HttpResponse::STATUS_405_METHOD_NOT_ALLOWED,
+               "unregistered PATCH should return 405");
+}
+
 void testHttpServerRouteParameterMatching() {
     HttpServer server;
     server.registerRoute(HttpRequest::METHOD_GET,
@@ -281,6 +368,7 @@ void testHttpServerOptionsAndAllowHeader() {
 
 int main() {
     testHttpRequestParsing();
+    testHttpRequestPatchMethodParsing();
     testHttpRequestJsonParsing();
     testHttpRequestClear();
     testHttpResponseSerialization();
@@ -288,6 +376,8 @@ int main() {
     testHttpResponseFileBodySize();
     testHttpResponseErrorFactories();
     testHttpServerRoutePatterns();
+    testHttpServerStaticFileValidationHeaders();
+    testHttpServerPatchMethodRouting();
     testHttpServerRouteParameterMatching();
     testHttpServerOptionsAndAllowHeader();
 
