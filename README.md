@@ -28,7 +28,7 @@
 │   ├── logger/      # 日志模块
 │   └── cache/       # 文件缓存
 ├── html_docs/       # 默认静态资源目录
-├── logs/            # 运行时日志目录
+├── build/logs/      # 运行时日志目录
 ├── scripts/         # 启停与清理脚本
 └── docs/            # 部署与性能文档
 ```
@@ -109,10 +109,9 @@ docker run -d --name cpp-http-server \
 
 ### 方式 2：使用启动脚本
 
-`scripts/start.sh` 默认在项目根目录查找 `http_server_cpp`。如果你只在 `build/` 目录生成了二进制，可以先复制到根目录再用脚本启动：
+`scripts/start.sh` 会优先使用 `build/http_server_cpp`，如果不存在再回退到项目根目录下的 `http_server_cpp`：
 
 ```bash
-cp ./build/http_server_cpp ./http_server_cpp
 ./scripts/start.sh -p 8080 -c ./http_server.conf
 ```
 
@@ -190,10 +189,10 @@ curl -i http://127.0.0.1:8080/index.html
 
 ## 日志
 
-默认日志目录为项目根目录下的 `logs/`，无论从哪里启动，日志都会统一写入这里。常见文件：
+默认日志目录为 `build/logs/`，无论从哪里启动，运行时日志都会统一写入这里。常见文件：
 
-- `logs/access.log`
-- `logs/error.log`
+- `build/logs/access.log`
+- `build/logs/error.log`
 
 ## 常见问题
 

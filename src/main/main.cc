@@ -6,6 +6,7 @@
 #include <sstream>
 #include <string>
 #include <filesystem>
+#include <system_error>
 #include "../server/http_server.h"
 #include "../logger/logger.h"
 
@@ -264,6 +265,31 @@ fs::path resolveProjectRoot(const char* argv0) {
 }
 
 /**
+ * @brief 解析运行时日志目录
+ *
+ * 优先写入仓库根目录下的 build/logs。若无法识别仓库根目录，但当前工作目录
+ * 本身就是 build 目录，则退回到当前目录下的 logs，以兼容容器内直接在 /app/build
+ * 启动的场景。
+ */
+fs::path resolveRuntimeLogDir(const char* argv0) {
+    fs::path projectRoot = resolveProjectRoot(argv0);
+    if (fs::exists(projectRoot / "CMakeLists.txt")) {
+        return projectRoot / "build" / "logs";
+    }
+
+    fs::path currentDir = fs::current_path();
+    if (currentDir.filename() == "build") {
+        return currentDir / "logs";
+    }
+
+    if (fs::exists(currentDir / "build")) {
+        return currentDir / "build" / "logs";
+    }
+
+    return currentDir / "logs";
+}
+
+/**
  * @brief 打印程序使用说明
  * 
  * 显示所有可用的命令行选项及其说明。
@@ -470,9 +496,13 @@ int main(int argc, char* argv[]) {
     // 初始化日志系统
     // 根据配置文件中的 log_to_console 设置决定是否输出到控制台
     bool consoleOutput = (config.logToConsole != 0);
-    fs::path executablePath = fs::absolute(fs::path(argv[0] ? argv[0] : ""));
-    fs::path logDir = executablePath.has_parent_path() ? executablePath.parent_path() / "logs" : fs::current_path() / "logs";
-    fs::create_directories(logDir);
+    fs::path logDir = resolveRuntimeLogDir(argv[0]);
+    std::error_code logDirError;
+    fs::create_directories(logDir, logDirError);
+    if (logDirError) {
+        std::cerr << "Failed to create log directory: " << logDir << " (" << logDirError.message() << ")" << std::endl;
+        return 1;
+    }
 
     std::string accessLogPath = (logDir / "access.log").string();
     std::string errorLogPath = (logDir / "error.log").string();

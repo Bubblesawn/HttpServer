@@ -1,9 +1,16 @@
 #!/bin/bash
 # HTTP 服务器启动脚本
 
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+BUILD_DIR="$PROJECT_ROOT/build"
+LOG_DIR="$BUILD_DIR/logs"
+
 # 默认配置
 PORT=8080
-CONFIG="./http_server.conf"
+CONFIG="$PROJECT_ROOT/http_server.conf"
 
 # 解析命令行参数
 while [[ $# -gt 0 ]]; do
@@ -24,13 +31,23 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
+SERVER_BIN="$BUILD_DIR/http_server_cpp"
+if [[ ! -x "$SERVER_BIN" ]]; then
+    SERVER_BIN="$PROJECT_ROOT/http_server_cpp"
+fi
+
+if [[ ! -x "$SERVER_BIN" ]]; then
+    echo "错误: 未找到可执行文件: $BUILD_DIR/http_server_cpp 或 $PROJECT_ROOT/http_server_cpp"
+    exit 1
+fi
+
+mkdir -p "$LOG_DIR"
+
 echo "=== HTTP 服务器启动脚本 ==="
 echo ""
 
 # 第一步：清理残留进程
 echo "步骤 1: 清理残留进程..."
-# 获取脚本所在目录，用于定位 cleanup.sh
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 "$SCRIPT_DIR/cleanup.sh" > /dev/null 2>&1
 
 # 第二步：检查端口是否被占用
@@ -60,6 +77,4 @@ fi
 echo ""
 echo "步骤 4: 启动 HTTP 服务器..."
 echo "=========================================="
-# 获取脚本所在目录的父目录（项目根目录），用于定位 http_server_cpp
-PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-"$PROJECT_ROOT/http_server_cpp" -c "$CONFIG"
+"$SERVER_BIN" -c "$CONFIG"
