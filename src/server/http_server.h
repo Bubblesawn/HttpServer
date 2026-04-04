@@ -20,6 +20,8 @@
 #include <vector>          // 动态数组
 #include <cstdint>         // 固定宽度整数
 
+#include <openssl/ssl.h>
+
 #include <nlohmann/json.hpp>
 
 // 前向声明 - 避免循环依赖
@@ -226,6 +228,16 @@ public:
     size_t getCacheMaxFileSize() const;
 
     /**
+     * @brief 配置 TLS/HTTPS 选项
+     *
+     * 该配置会在 start() 时生效。启用后，所有连接都会使用 TLS 握手和加密传输。
+     */
+    void setTlsConfig(bool enabled,
+                      const std::string& certFile,
+                      const std::string& keyFile,
+                      const std::string& cipherSuites);
+
+    /**
      * @brief 获取缓存统计信息
      * 
         * @return nlohmann::json 缓存统计信息对象
@@ -282,7 +294,18 @@ public:
      * @param pathPattern 路由模式
      * @param handler 处理函数
      */
-    void registerRoutePattern(HttpRequest::Method method, const std::string& pathPattern, RequestHandler handler);
+    void registerRoutePattern(HttpRequest::Method method,
+                              const std::string& pathPattern,
+                              RequestHandler handler,
+                              const std::map<std::string, std::string>& requiredParams = {});
+
+    /**
+     * @brief 注册单个路由
+     */
+    void registerRoute(HttpRequest::Method method,
+                       const std::string& path,
+                       RequestHandler handler,
+                       const std::map<std::string, std::string>& requiredParams = {});
 
     /**
      * @brief 处理一个已经解析好的请求
@@ -304,12 +327,18 @@ public:
     std::string getLocalIp() const;
 
 private:
-    using RouteTable = std::unordered_map<std::string, RequestHandler>;
+    struct RouteEntry {
+        RequestHandler handler;
+        std::map<std::string, std::string> requiredParams;
+    };
+
+    using RouteTable = std::unordered_map<std::string, std::vector<RouteEntry>>;
 
     struct RoutePattern {
         HttpRequest::Method method;
         std::string pattern;
         RequestHandler handler;
+        std::map<std::string, std::string> requiredParams;
     };
 
     /**
@@ -347,11 +376,6 @@ private:
      * @brief 注册默认路由
      */
     void registerDefaultRoutes();
-
-    /**
-     * @brief 注册单个路由
-     */
-    void registerRoute(HttpRequest::Method method, const std::string& path, RequestHandler handler);
 
     /**
      * @brief 执行请求处理中间件链
@@ -397,6 +421,11 @@ private:
                            std::map<std::string, std::string>& pathParams) const;
 
     /**
+     * @brief 判断请求参数是否满足路由条件
+     */
+    bool matchRouteParams(const HttpRequest& request, const std::map<std::string, std::string>& requiredParams) const;
+
+    /**
      * @brief 处理客户端请求
      *
      * 解析HTTP请求，调用处理函数生成响应，并发送回客户端。
@@ -407,7 +436,10 @@ private:
      * @param clientPort 客户端端口号
      * @return bool 返回true表示连接应保持（Keep-Alive），false表示应关闭连接
      */
-    bool handleClient(int clientSocket, const std::string& clientIp, int clientPort);
+    bool handleClient(int clientSocket,
+                      const std::string& clientIp,
+                      int clientPort,
+                      SSL* ssl = nullptr);
 
     /**
      * @brief 解析HTTP请求
@@ -417,7 +449,7 @@ private:
      * @param clientSocket 客户端socket描述符
      * @return HttpRequest 解析后的请求对象
      */
-    HttpRequest parseRequest(int clientSocket) const;
+    HttpRequest parseRequest(int clientSocket, SSL* ssl = nullptr) const;
 
     /**
      * @brief 处理静态文件请求
@@ -510,7 +542,7 @@ private:
      * @param line 存储读取结果的字符串引用
      * @return int 读取的字节数，-1表示错误或连接关闭
      */
-    int readLine(int socket, std::string& line) const;
+    int readLine(int socket, std::string& line, SSL* ssl = nullptr) const;
 
     /**
      * @brief 从socket读取数据
@@ -522,7 +554,7 @@ private:
      * @param size 要读取的字节数
      * @return ssize_t 实际读取的字节数
      */
-    ssize_t readData(int socket, char* buffer, size_t size) const;
+    ssize_t readData(int socket, char* buffer, size_t size, SSL* ssl = nullptr) const;
 
     /**
      * @brief 向socket发送数据
@@ -534,7 +566,22 @@ private:
      * @param size 要发送的字节数
      * @return ssize_t 实际发送的字节数
      */
-    ssize_t sendData(int socket, const char* data, size_t size) const;
+    ssize_t sendData(int socket, const char* data, size_t size, SSL* ssl = nullptr) const;
+
+    /**
+     * @brief 创建并初始化单个 TLS 会话
+     */
+    std::shared_ptr<SSL> createTlsSession(int clientSocket) const;
+
+    /**
+     * @brief 初始化 TLS 上下文
+     */
+    bool setupTlsContext();
+
+    /**
+     * @brief 释放 TLS 上下文
+     */
+    void destroyTlsContext();
 
     //================== 成员变量 ==================
 
@@ -549,6 +596,21 @@ private:
 
     /** 线程池工作线程数量 */
     int m_numThreads;
+
+    /** TLS 是否启用 */
+    bool m_tlsEnabled = false;
+
+    /** TLS 证书路径 */
+    std::string m_tlsCertFile;
+
+    /** TLS 私钥路径 */
+    std::string m_tlsKeyFile;
+
+    /** TLS 密码套件配置 */
+    std::string m_tlsCipherSuites;
+
+    /** TLS 上下文 */
+    SSL_CTX* m_tlsContext = nullptr;
 
     /** 服务器运行状态标志（原子操作保证线程安全） */
     std::atomic<bool> m_running;
@@ -584,6 +646,7 @@ private:
         std::string ip;     // 客户端IP地址
         int port;           // 客户端端口号
         std::string readBuffer;  // 读取缓冲区（用于边缘触发模式）
+        std::shared_ptr<SSL> tlsSession;  // TLS 会话（启用 HTTPS 时使用）
     };
 
     /** 客户端信息映射（fd -> ClientInfo） */

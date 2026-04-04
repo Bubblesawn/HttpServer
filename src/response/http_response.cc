@@ -15,6 +15,20 @@
 
 namespace {
 
+/**
+ * @brief 序列化响应头并统一处理重复字段。
+ *
+ * 该辅助函数负责把 HttpResponse 内部的头字段写入最终字符串，同时强制保持
+ * 以下规则：
+ * - Content-Type 只从响应对象的专用字段输出一次
+ * - Connection、Content-Type、Content-Length 不在通用头循环中重复输出
+ * - Server 头固定注入，保证响应格式一致
+ * - Connection 末尾统一输出，缺省值为 Close
+ *
+ * @param result 目标响应字符串，已包含状态行
+ * @param response 待序列化的响应对象
+ * @param contentLength 最终发送给客户端的正文长度
+ */
 void appendSerializedHeaders(std::string& result, const HttpResponse& response, size_t contentLength) {
     if (!response.getContentType().empty()) {
         result += "Content-Type: " + response.getContentType() + "\r\n";

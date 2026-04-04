@@ -39,6 +39,7 @@ public:
         METHOD_GET,     /**< GET方法：请求获取指定资源 */
         METHOD_OPTIONS, /**< OPTIONS方法：查询支持的通信选项 */
         METHOD_POST,   /**< POST方法：向指定资源提交数据 */
+        METHOD_PATCH,   /**< PATCH方法：对资源进行部分修改 */
         METHOD_PUT,    /**< PUT方法：替换指定资源 */
         METHOD_DELETE, /**< DELETE方法：删除指定资源 */
         METHOD_HEAD,   /**< HEAD方法：获取资源头部信息（与GET相同但不返回响应体） */

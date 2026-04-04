@@ -6,6 +6,7 @@
 #include <sstream>
 #include <string>
 #include <filesystem>
+#include <system_error>
 #include "../server/http_server.h"
 #include "../logger/logger.h"
 
@@ -57,6 +58,10 @@ struct Config {
     int cacheEnabled;      /**< 是否启用文件缓存 */
     size_t cacheMaxSize;   /**< 缓存最大容量 */
     size_t cacheMaxFileSize; /**< 单文件最大缓存大小 */
+    int enableTls;         /**< 是否启用 TLS/HTTPS */
+    std::string tlsCertFile;    /**< TLS 证书文件 */
+    std::string tlsKeyFile;     /**< TLS 私钥文件 */
+    std::string tlsCipherSuites; /**< TLS 密码套件 */
     
     Config()
         : port(8080)
@@ -66,7 +71,11 @@ struct Config {
         , logToConsole(0)
         , cacheEnabled(1)
         , cacheMaxSize(100 * 1024 * 1024)
-        , cacheMaxFileSize(1 * 1024 * 1024) {}
+        , cacheMaxFileSize(1 * 1024 * 1024)
+        , enableTls(0)
+        , tlsCertFile("")
+        , tlsKeyFile("")
+        , tlsCipherSuites("") {}
 };
 
 LogLevel debugToLogLevel(int debug) {
@@ -166,6 +175,18 @@ bool parseConfigFile(const std::string& configFilePath, Config& config) {
             } catch (...) {
                 std::cerr << "Warning: invalid cache_max_file_size value in config: " << value << std::endl;
             }
+        } else if (key == "enable_tls") {
+            try {
+                config.enableTls = std::stoi(value);
+            } catch (...) {
+                std::cerr << "Warning: invalid enable_tls value in config: " << value << std::endl;
+            }
+        } else if (key == "tls_cert_file") {
+            config.tlsCertFile = value;
+        } else if (key == "tls_key_file") {
+            config.tlsKeyFile = value;
+        } else if (key == "tls_cipher_suites") {
+            config.tlsCipherSuites = value;
         }
     }
     
@@ -264,6 +285,31 @@ fs::path resolveProjectRoot(const char* argv0) {
 }
 
 /**
+ * @brief 解析运行时日志目录
+ *
+ * 优先写入仓库根目录下的 build/logs。若无法识别仓库根目录，但当前工作目录
+ * 本身就是 build 目录，则退回到当前目录下的 logs，以兼容容器内直接在 /app/build
+ * 启动的场景。
+ */
+fs::path resolveRuntimeLogDir(const char* argv0) {
+    fs::path projectRoot = resolveProjectRoot(argv0);
+    if (fs::exists(projectRoot / "CMakeLists.txt")) {
+        return projectRoot / "build" / "logs";
+    }
+
+    fs::path currentDir = fs::current_path();
+    if (currentDir.filename() == "build") {
+        return currentDir / "logs";
+    }
+
+    if (fs::exists(currentDir / "build")) {
+        return currentDir / "build" / "logs";
+    }
+
+    return currentDir / "logs";
+}
+
+/**
  * @brief 打印程序使用说明
  * 
  * 显示所有可用的命令行选项及其说明。
@@ -277,6 +323,10 @@ void printUsage(const char* programName) {
               << "  -p, --port PORT        Server port (default: 8080)\n"
               << "  -d, --doc-root DIR     Document root directory (default: ./html_docs)\n"
               << "  -t, --threads NUM      Number of threads (default: 4)\n"
+              << "  -S, --tls              Enable TLS/HTTPS\n"
+              << "  -C, --tls-cert FILE    TLS certificate file\n"
+              << "  -K, --tls-key FILE     TLS private key file\n"
+              << "  -Y, --tls-ciphers LIST TLS cipher suite list\n"
               << "  -h, --help             Show this help message\n"
               << "  -v, --version          Show version information\n";
 }
@@ -325,28 +375,23 @@ int main(int argc, char* argv[]) {
     /** 配置文件路径 */
     std::string configFile = "./http_server.conf";
     std::string resolvedConfigFile = configFile;
-    
+
     /**
-     * 第一步：先解析 -c 参数获取配置文件路径
+     * 第一步：先扫描配置文件参数，避免 getopt 的两遍解析互相影响。
      */
-    static struct option configOption[] = {
-        {"config", required_argument, 0, 'c'},
-        {0, 0, 0, 0}
-    };
-    
-    int opt;
-    int optionIndex = 0;
-    int oldOpterr = opterr;
-    opterr = 0;  // 首轮仅识别 -c，忽略其他参数的错误提示
-    while ((opt = getopt_long(argc, argv, "c:", configOption, &optionIndex)) != -1) {
-        if (opt == 'c') {
-            configFile = optarg;
+    for (int i = 1; i < argc; ++i) {
+        std::string currentArg = argv[i] ? argv[i] : "";
+        if (currentArg == "-c" || currentArg == "--config") {
+            if (i + 1 < argc && argv[i + 1]) {
+                configFile = argv[i + 1];
+            }
+        } else if (currentArg.rfind("--config=", 0) == 0) {
+            configFile = currentArg.substr(std::string("--config=").length());
         }
     }
-    opterr = oldOpterr;
     
-    /** 重置 optind 以便后续解析其他参数 */
-    optind = 1;
+    /** 重置 getopt 状态以便后续解析其他参数 */
+    optind = 0;
     
     /**
      * 第二步：解析配置文件
@@ -361,10 +406,20 @@ int main(int argc, char* argv[]) {
     int port = config.port;
     std::string docRoot = config.docRoot;
     int numThreads = config.threadPoolSize;
+    std::string tlsCertFile = config.tlsCertFile;
+    std::string tlsKeyFile = config.tlsKeyFile;
+    std::string tlsCipherSuites = config.tlsCipherSuites;
+    bool enableTls = (config.enableTls != 0);
 
     // 若配置中是相对路径，则基于配置文件目录解析，避免在 build/ 启动时路径失效
     if (!resolvedConfigFile.empty()) {
         docRoot = resolvePathByConfigDir(docRoot, resolvedConfigFile);
+        if (!tlsCertFile.empty()) {
+            tlsCertFile = resolvePathByConfigDir(tlsCertFile, resolvedConfigFile);
+        }
+        if (!tlsKeyFile.empty()) {
+            tlsKeyFile = resolvePathByConfigDir(tlsKeyFile, resolvedConfigFile);
+        }
     }
     
     /** 第三步：解析其他命令行参数（命令行参数优先级最高） */
@@ -373,12 +428,16 @@ int main(int argc, char* argv[]) {
         {"port", required_argument, 0, 'p'},
         {"doc-root", required_argument, 0, 'd'},
         {"threads", required_argument, 0, 't'},
+        {"tls", no_argument, 0, 'S'},
+        {"tls-cert", required_argument, 0, 'C'},
+        {"tls-key", required_argument, 0, 'K'},
+        {"tls-ciphers", required_argument, 0, 'Y'},
         {"help", no_argument, 0, 'h'},
         {"version", no_argument, 0, 'v'},
         {0, 0, 0, 0}
     };
 
-    optionIndex = 0;
+    int optionIndex = 0;
     int c;
 
     /**
@@ -393,7 +452,7 @@ int main(int argc, char* argv[]) {
      *   - -1:   所有选项已解析完毕
      *   - '?':  遇到未知选项或缺少必需参数
      */
-    while ((c = getopt_long(argc, argv, "c:p:d:t:hv", longOptions, &optionIndex)) != -1) {
+    while ((c = getopt_long(argc, argv, "c:p:d:t:SC:K:Y:hv", longOptions, &optionIndex)) != -1) {
         switch (c) {
             case 'c':
                 /** 设置配置文件路径 */
@@ -422,6 +481,18 @@ int main(int argc, char* argv[]) {
                     return 1;
                 }
                 break;
+            case 'S':
+                enableTls = true;
+                break;
+            case 'C':
+                tlsCertFile = optarg;
+                break;
+            case 'K':
+                tlsKeyFile = optarg;
+                break;
+            case 'Y':
+                tlsCipherSuites = optarg;
+                break;
             case 'h':
                 /** 显示帮助信息 */
                 printUsage(argv[0]);
@@ -435,6 +506,13 @@ int main(int argc, char* argv[]) {
                 printUsage(argv[0]);
                 return 1;
         }
+    }
+
+    if (!tlsCertFile.empty()) {
+        tlsCertFile = resolvePathByConfigDir(tlsCertFile, resolvedConfigFile);
+    }
+    if (!tlsKeyFile.empty()) {
+        tlsKeyFile = resolvePathByConfigDir(tlsKeyFile, resolvedConfigFile);
     }
 
     /**
@@ -470,9 +548,13 @@ int main(int argc, char* argv[]) {
     // 初始化日志系统
     // 根据配置文件中的 log_to_console 设置决定是否输出到控制台
     bool consoleOutput = (config.logToConsole != 0);
-    fs::path executablePath = fs::absolute(fs::path(argv[0] ? argv[0] : ""));
-    fs::path logDir = executablePath.has_parent_path() ? executablePath.parent_path() / "logs" : fs::current_path() / "logs";
-    fs::create_directories(logDir);
+    fs::path logDir = resolveRuntimeLogDir(argv[0]);
+    std::error_code logDirError;
+    fs::create_directories(logDir, logDirError);
+    if (logDirError) {
+        std::cerr << "Failed to create log directory: " << logDir << " (" << logDirError.message() << ")" << std::endl;
+        return 1;
+    }
 
     std::string accessLogPath = (logDir / "access.log").string();
     std::string errorLogPath = (logDir / "error.log").string();
@@ -481,11 +563,29 @@ int main(int argc, char* argv[]) {
         return 1;
     }
 
+    if (enableTls && (tlsCertFile.empty() || tlsKeyFile.empty())) {
+        std::cerr << "Error: TLS is enabled but certificate or private key file is missing" << std::endl;
+        return 1;
+    }
+
+    if (enableTls) {
+        if (!fs::exists(tlsCertFile)) {
+            std::cerr << "Error: TLS certificate file not found: " << tlsCertFile << std::endl;
+            return 1;
+        }
+        if (!fs::exists(tlsKeyFile)) {
+            std::cerr << "Error: TLS private key file not found: " << tlsKeyFile << std::endl;
+            return 1;
+        }
+    }
+
     /** 创建HTTP服务器实例，监听所有网络接口 */
     HttpServer server("0.0.0.0", port);
 
     /** 配置服务器线程池大小 */
     server.setNumThreads(numThreads);
+
+    server.setTlsConfig(enableTls, tlsCertFile, tlsKeyFile, tlsCipherSuites);
 
     /** 应用可热更新配置 */
     applyRuntimeConfig(server, config, docRoot);
@@ -517,6 +617,7 @@ int main(int argc, char* argv[]) {
 
             Config reloadedConfig;
             if (parseConfigFile(resolvedConfigFile, reloadedConfig)) {
+                Config previousConfig = config;
                 docRoot = resolvePathByConfigDir(reloadedConfig.docRoot, resolvedConfigFile);
                 applyRuntimeConfig(server, reloadedConfig, docRoot);
                 config = reloadedConfig;
@@ -527,6 +628,12 @@ int main(int argc, char* argv[]) {
                 }
                 if (reloadedConfig.threadPoolSize != server.getNumThreads()) {
                     LOG_WARN("Reloaded config changed thread pool size; restart is required to apply it");
+                }
+                if (reloadedConfig.enableTls != previousConfig.enableTls ||
+                    reloadedConfig.tlsCertFile != previousConfig.tlsCertFile ||
+                    reloadedConfig.tlsKeyFile != previousConfig.tlsKeyFile ||
+                    reloadedConfig.tlsCipherSuites != previousConfig.tlsCipherSuites) {
+                    LOG_WARN("Reloaded config changed TLS settings; restart is required to apply it");
                 }
             } else {
                 LOG_WARN("Failed to reload config from: " + resolvedConfigFile);

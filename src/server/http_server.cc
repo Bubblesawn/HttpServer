@@ -30,12 +30,16 @@
 #include <cerrno>           // 错误处理
 #include <fstream>           // 文件流
 #include <sstream>           // 字符串流
+#include <iomanip>           // 日期格式化
+#include <ctime>             // 时间处理
 #include <algorithm>         // 算法
 #include <cctype>           // 字符处理
 #include <limits>           // 数值边界
 #include <iostream>          // 输入输出
 #include <unordered_map>     // socket读取缓冲
 #include <vector>
+
+#include <openssl/err.h>
 
 #include <nlohmann/json.hpp>
 
@@ -45,9 +49,56 @@
 #endif
 
 namespace {
+/**
+ * @brief 保护按 socket 复用的跨请求读取缓冲区。
+ *
+ * 该互斥量用于同步访问 g_socketReadBuffers，避免在多线程处理并发连接时
+ * 出现同一文件描述符的读缓冲被并发修改。
+ */
 std::mutex g_readBufferMutex;
+
+/**
+ * @brief 按 socket 保存的增量读取缓冲区。
+ *
+ * 当 HTTP 请求在边缘触发模式下被分段读取时，服务器会把未消费完的字节
+ * 保存在这里，下一次读取同一连接时继续拼接解析。
+ */
 std::unordered_map<int, std::string> g_socketReadBuffers;
 
+/**
+ * @brief 初始化 OpenSSL 全局状态，仅执行一次。
+ */
+std::once_flag g_openSslInitOnce;
+
+void initializeOpenSsl() {
+    std::call_once(g_openSslInitOnce, []() {
+        OPENSSL_init_ssl(0, nullptr);
+    });
+}
+
+/**
+ * @brief 获取 OpenSSL 错误栈的字符串表示。
+ */
+std::string getOpenSslErrorMessage() {
+    unsigned long errorCode = ERR_get_error();
+    if (errorCode == 0) {
+        return "unknown OpenSSL error";
+    }
+
+    char buffer[256];
+    ERR_error_string_n(errorCode, buffer, sizeof(buffer));
+    return buffer;
+}
+
+/**
+ * @brief 生成输入字符串的小写副本。
+ *
+ * 该工具函数主要用于对 HTTP 头部名和头部值做大小写不敏感判断，避免修改
+ * 原始字符串。
+ *
+ * @param input 原始字符串
+ * @return std::string 小写化后的拷贝
+ */
 std::string toLowerCopy(const std::string& input) {
     std::string output = input;
     std::transform(output.begin(), output.end(), output.begin(), [](unsigned char ch) {
@@ -56,6 +107,14 @@ std::string toLowerCopy(const std::string& input) {
     return output;
 }
 
+/**
+ * @brief 将 URL 路径按 '/' 分割为段列表。
+ *
+ * 该函数会忽略连续斜杠和空段，适合用于路由模式匹配和路径规范化判断。
+ *
+ * @param path 原始路径
+ * @return std::vector<std::string> 分段后的路径组件
+ */
 std::vector<std::string> splitPathSegments(const std::string& path) {
     std::vector<std::string> segments;
     size_t start = 0;
@@ -80,6 +139,19 @@ std::vector<std::string> splitPathSegments(const std::string& path) {
     return segments;
 }
 
+/**
+ * @brief 判断请求是否倾向于 JSON 响应。
+ *
+ * 判定依据按优先级依次为：
+ * - Accept 头包含 application/json
+ * - Content-Type 头为 JSON 相关媒体类型
+ * - 路径以前缀 /api/ 开头
+ *
+ * 该逻辑用于统一错误响应的返回格式，保证 API 路径优先返回 JSON。
+ *
+ * @param request HTTP 请求对象
+ * @return bool 如果应返回 JSON 则为 true
+ */
 bool containsJsonAcceptHeader(const HttpRequest& request) {
     const std::string accept = toLowerCopy(request.getHeader("Accept"));
     if (accept.find("application/json") != std::string::npos) {
@@ -95,6 +167,15 @@ bool containsJsonAcceptHeader(const HttpRequest& request) {
     return request.getPath().rfind("/api/", 0) == 0;
 }
 
+/**
+ * @brief 将字符串值转换为 JSON 值。
+ *
+ * 如果输入已经是合法 JSON 文本，则按 JSON 结构解析；否则将其作为字符串值
+ * 返回，避免把普通文本错误地包装成 JSON 对象。
+ *
+ * @param value 原始字符串
+ * @return nlohmann::json 对应的 JSON 值
+ */
 nlohmann::json valueToJson(const std::string& value) {
     const auto parsed = nlohmann::json::parse(value, nullptr, false);
     if (!parsed.is_discarded()) {
@@ -104,6 +185,14 @@ nlohmann::json valueToJson(const std::string& value) {
     return value;
 }
 
+/**
+ * @brief 将字符串键值对映射转换为 JSON 对象。
+ *
+ * 所有值都按字符串原样写入，适合用于查询参数、表单参数和调试型回显。
+ *
+ * @param values 输入键值对
+ * @return nlohmann::json JSON 对象
+ */
 nlohmann::json mapToJsonObject(const std::map<std::string, std::string>& values) {
     nlohmann::json object = nlohmann::json::object();
     for (const auto& pair : values) {
@@ -112,6 +201,15 @@ nlohmann::json mapToJsonObject(const std::map<std::string, std::string>& values)
     return object;
 }
 
+/**
+ * @brief 将字符串键值对映射转换为 JSON 对象，并尝试解析字段值。
+ *
+ * 该函数会对每个 value 调用 valueToJson，以便数字、布尔值和嵌套 JSON 能够
+ * 以结构化形式保留。
+ *
+ * @param values 输入键值对
+ * @return nlohmann::json JSON 对象
+ */
 nlohmann::json parsedValueMapToJsonObject(const std::map<std::string, std::string>& values) {
     nlohmann::json object = nlohmann::json::object();
     for (const auto& pair : values) {
@@ -120,12 +218,27 @@ nlohmann::json parsedValueMapToJsonObject(const std::map<std::string, std::strin
     return object;
 }
 
+/**
+ * @brief 单段 Range 解析结果。
+ *
+ * NOT_PRESENT 表示请求没有提供 Range 头；
+ * VALID 表示 Range 语法正确并可应用；
+ * INVALID 表示请求头存在但格式或边界不合法。
+ */
 enum class RangeParseResult {
     NOT_PRESENT,
     VALID,
     INVALID
 };
 
+/**
+ * @brief 去除字符串首尾空白字符。
+ *
+ * 主要用于解析 HTTP 头部值和 Range 片段，确保额外空格不会影响判断。
+ *
+ * @param input 原始字符串
+ * @return std::string 去空白后的结果
+ */
 std::string trimWhitespace(const std::string& input) {
     const size_t start = input.find_first_not_of(" \t");
     if (start == std::string::npos) {
@@ -135,6 +248,23 @@ std::string trimWhitespace(const std::string& input) {
     return input.substr(start, end - start + 1);
 }
 
+/**
+ * @brief 解析单段 HTTP Range 请求头。
+ *
+ * 支持以下语法：
+ * - bytes=start-end
+ * - bytes=start-
+ * - bytes=-suffixLength
+ *
+ * 该函数只处理单段范围。遇到多段范围、非法前缀或越界值时返回 INVALID；
+ * 请求未携带 Range 头时返回 NOT_PRESENT。
+ *
+ * @param rangeHeader 原始 Range 头值
+ * @param fileSize 文件总大小，用于边界裁剪
+ * @param rangeStart 解析出的起始字节
+ * @param rangeEnd 解析出的结束字节
+ * @return RangeParseResult 解析结果
+ */
 RangeParseResult parseSingleRangeHeader(const std::string& rangeHeader,
                                         off_t fileSize,
                                         off_t& rangeStart,
@@ -223,16 +353,187 @@ RangeParseResult parseSingleRangeHeader(const std::string& rangeHeader,
     }
 }
 
+/**
+ * @brief 删除某个 socket 的残留读取缓冲。
+ *
+ * 当连接关闭或请求处理完成后调用，避免旧数据在连接重用时污染后续解析。
+ *
+ * @param fd socket 文件描述符
+ */
 void clearSocketReadBuffer(int fd) {
     std::lock_guard<std::mutex> lock(g_readBufferMutex);
     g_socketReadBuffers.erase(fd);
 }
 
+/**
+ * @brief 将响应转换为 HEAD 语义。
+ *
+ * 保留响应的状态码和头部信息，仅清空正文和文件路径，确保响应头中的
+ * Content-Length 与最终发送行为一致。
+ *
+ * @param response 待调整的响应对象
+ */
 void stripResponseBodyForHead(HttpResponse& response) {
     const std::string contentType = response.getContentType();
     response.setBody("");
     response.setFilePath("");
     response.setContentType(contentType);
+}
+
+/**
+ * @brief 将时间戳格式化为 HTTP 日期字符串。
+ *
+ * 输出格式符合 RFC 9110 的 IMF-fixdate 形式，例如：
+ * Mon, 02 Jan 2006 15:04:05 GMT
+ *
+ * @param value UTC 时间戳
+ * @return std::string HTTP 日期字符串
+ */
+std::string formatHttpDate(time_t value) {
+    std::tm gmTime{};
+    gmtime_r(&value, &gmTime);
+
+    std::ostringstream output;
+    output.imbue(std::locale::classic());
+    output << std::put_time(&gmTime, "%a, %d %b %Y %H:%M:%S GMT");
+    return output.str();
+}
+
+/**
+ * @brief 解析 HTTP 日期字符串。
+ *
+ * 目前支持与 formatHttpDate 对称的 IMF-fixdate 格式，失败时返回 false。
+ *
+ * @param value HTTP 日期字符串
+ * @param parsedTime 解析后的 UTC 时间戳
+ * @return bool 解析成功返回 true
+ */
+bool parseHttpDate(const std::string& value, time_t& parsedTime) {
+    std::tm tm{};
+    std::istringstream input(value);
+    input.imbue(std::locale::classic());
+    input >> std::get_time(&tm, "%a, %d %b %Y %H:%M:%S GMT");
+    if (input.fail()) {
+        return false;
+    }
+
+    tm.tm_isdst = 0;
+    const time_t converted = timegm(&tm);
+    if (converted < 0) {
+        return false;
+    }
+
+    parsedTime = converted;
+    return true;
+}
+
+/**
+ * @brief 去除实体标签的弱标签前缀与包裹引号。
+ *
+ * 用于比较 If-None-Match 中的 ETag 值时统一格式，兼容 W/"etag"、"etag"
+ * 和裸值写法。
+ *
+ * @param value 原始实体标签值
+ * @return std::string 规范化后的标签内容
+ */
+std::string trimCopy(const std::string& value) {
+    const size_t start = value.find_first_not_of(" \t");
+    if (start == std::string::npos) {
+        return "";
+    }
+
+    const size_t end = value.find_last_not_of(" \t");
+    return value.substr(start, end - start + 1);
+}
+
+std::string normalizeEntityTag(const std::string& value) {
+    std::string normalized = trimCopy(value);
+    if (normalized.size() >= 2 && (normalized[0] == 'W' || normalized[0] == 'w') && normalized[1] == '/') {
+        normalized = trimCopy(normalized.substr(2));
+    }
+
+    if (normalized.size() >= 2 && normalized.front() == '"' && normalized.back() == '"') {
+        normalized = normalized.substr(1, normalized.size() - 2);
+    }
+
+    return normalized;
+}
+
+/**
+ * @brief 构造静态文件的实体标签。
+ *
+ * 当前实现基于 inode、文件大小和修改时间生成稳定的弱校验值，用于缓存验证。
+ *
+ * @param fileStat 文件状态信息
+ * @return std::string ETag 字符串
+ */
+std::string buildStaticFileEtag(const struct stat& fileStat) {
+    std::ostringstream output;
+    output << '"' << std::hex << static_cast<unsigned long long>(fileStat.st_ino) << '-'
+           << static_cast<unsigned long long>(fileStat.st_size) << '-'
+           << static_cast<unsigned long long>(fileStat.st_mtime) << '"';
+    return output.str();
+}
+
+/**
+ * @brief 判断 If-None-Match 是否命中当前 ETag。
+ *
+ * 支持逗号分隔的多个实体标签以及通配符 *。
+ *
+ * @param headerValue If-None-Match 头部值
+ * @param currentEtag 当前资源的 ETag
+ * @return bool 如果命中则返回 true
+ */
+bool matchesIfNoneMatch(const std::string& headerValue, const std::string& currentEtag) {
+    const std::string normalizedCurrent = normalizeEntityTag(currentEtag);
+    if (normalizedCurrent.empty()) {
+        return false;
+    }
+
+    const std::string trimmedHeader = trimCopy(headerValue);
+    if (trimmedHeader == "*") {
+        return true;
+    }
+
+    std::istringstream input(headerValue);
+    std::string token;
+    while (std::getline(input, token, ',')) {
+        if (normalizeEntityTag(token) == normalizedCurrent) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+/**
+ * @brief 判断请求是否满足缓存未修改条件。
+ *
+ * 先检查 If-None-Match，再回退到 If-Modified-Since。只要任一条件命中，就可以
+ * 返回 304 Not Modified。
+ *
+ * @param request HTTP 请求对象
+ * @param fileStat 文件状态信息
+ * @param etag 当前资源的 ETag
+ * @return bool 如果可以返回 304 则返回 true
+ */
+bool isConditionalNotModified(const HttpRequest& request,
+                              const struct stat& fileStat,
+                              const std::string& etag) {
+    const std::string ifNoneMatch = request.getHeader("If-None-Match");
+    if (!ifNoneMatch.empty()) {
+        return matchesIfNoneMatch(ifNoneMatch, etag);
+    }
+
+    const std::string ifModifiedSince = request.getHeader("If-Modified-Since");
+    if (!ifModifiedSince.empty()) {
+        time_t parsedTime = 0;
+        if (parseHttpDate(ifModifiedSince, parsedTime)) {
+            return parsedTime >= fileStat.st_mtime;
+        }
+    }
+
+    return false;
 }
 } // namespace
 
@@ -305,6 +606,10 @@ bool HttpServer::start() {
         return false;
     }
 
+    if (m_tlsEnabled && !setupTlsContext()) {
+        return false;
+    }
+
     m_threadPool = std::make_unique<ThreadPool>(m_numThreads);
     m_fileCache = std::make_unique<FileCache>();
     m_tcpServer = std::make_unique<TcpServer>(m_ip, m_port, m_useEpoll);
@@ -321,6 +626,7 @@ bool HttpServer::start() {
         }
         m_fileCache.reset();
         m_tcpServer.reset();
+        destroyTlsContext();
         m_running.store(false);
         return false;
     }
@@ -330,9 +636,111 @@ bool HttpServer::start() {
     LOG_INFO("Server started on " + m_ip + ":" + std::to_string(m_port));
     LOG_INFO("Document root: " + m_docRoot);
     LOG_INFO("Thread pool size: " + std::to_string(m_numThreads));
+    LOG_INFO(std::string("Transport: ") + (m_tlsEnabled ? "HTTPS" : "HTTP"));
     LOG_INFO(std::string("Mode: ") + (m_useEpoll ? "epoll + thread pool (hybrid)" : "thread pool (one-thread-per-connection)"));
 
     return true;
+}
+
+/**
+ * @brief 初始化 TLS 上下文
+ */
+bool HttpServer::setupTlsContext() {
+    if (!m_tlsEnabled) {
+        return true;
+    }
+
+    initializeOpenSsl();
+
+    destroyTlsContext();
+
+    m_tlsContext = SSL_CTX_new(TLS_server_method());
+    if (!m_tlsContext) {
+        LOG_ERROR("Failed to create TLS context: " + getOpenSslErrorMessage());
+        return false;
+    }
+
+    SSL_CTX_set_mode(m_tlsContext, SSL_MODE_AUTO_RETRY);
+    SSL_CTX_set_min_proto_version(m_tlsContext, TLS1_2_VERSION);
+    SSL_CTX_set_options(m_tlsContext, SSL_OP_NO_COMPRESSION);
+
+    if (!m_tlsCipherSuites.empty()) {
+        bool cipherConfigured = false;
+        if (SSL_CTX_set_cipher_list(m_tlsContext, m_tlsCipherSuites.c_str()) == 1) {
+            cipherConfigured = true;
+        }
+
+#if OPENSSL_VERSION_NUMBER >= 0x10101000L
+        if (SSL_CTX_set_ciphersuites(m_tlsContext, m_tlsCipherSuites.c_str()) == 1) {
+            cipherConfigured = true;
+        }
+#endif
+
+        if (!cipherConfigured) {
+            LOG_ERROR("Failed to configure TLS cipher suites: " + m_tlsCipherSuites + " (" + getOpenSslErrorMessage() + ")");
+            destroyTlsContext();
+            return false;
+        }
+    }
+
+    if (SSL_CTX_use_certificate_file(m_tlsContext, m_tlsCertFile.c_str(), SSL_FILETYPE_PEM) != 1) {
+        LOG_ERROR("Failed to load TLS certificate: " + m_tlsCertFile + " (" + getOpenSslErrorMessage() + ")");
+        destroyTlsContext();
+        return false;
+    }
+
+    if (SSL_CTX_use_PrivateKey_file(m_tlsContext, m_tlsKeyFile.c_str(), SSL_FILETYPE_PEM) != 1) {
+        LOG_ERROR("Failed to load TLS private key: " + m_tlsKeyFile + " (" + getOpenSslErrorMessage() + ")");
+        destroyTlsContext();
+        return false;
+    }
+
+    if (SSL_CTX_check_private_key(m_tlsContext) != 1) {
+        LOG_ERROR("TLS certificate and private key do not match: " + getOpenSslErrorMessage());
+        destroyTlsContext();
+        return false;
+    }
+
+    return true;
+}
+
+/**
+ * @brief 释放 TLS 上下文
+ */
+void HttpServer::destroyTlsContext() {
+    if (m_tlsContext) {
+        SSL_CTX_free(m_tlsContext);
+        m_tlsContext = nullptr;
+    }
+}
+
+/**
+ * @brief 创建单个 TLS 会话
+ */
+std::shared_ptr<SSL> HttpServer::createTlsSession(int clientSocket) const {
+    if (!m_tlsEnabled || !m_tlsContext) {
+        return nullptr;
+    }
+
+    SSL* rawSession = SSL_new(m_tlsContext);
+    if (!rawSession) {
+        LOG_ERROR("Failed to create TLS session for fd " + std::to_string(clientSocket) + ": " + getOpenSslErrorMessage());
+        return nullptr;
+    }
+
+    if (SSL_set_fd(rawSession, clientSocket) != 1) {
+        LOG_ERROR("Failed to bind TLS session to fd " + std::to_string(clientSocket) + ": " + getOpenSslErrorMessage());
+        SSL_free(rawSession);
+        return nullptr;
+    }
+
+    SSL_set_accept_state(rawSession);
+
+    return std::shared_ptr<SSL>(rawSession, [](SSL* session) {
+        if (session) {
+            SSL_free(session);
+        }
+    });
 }
 
 /**
@@ -377,6 +785,8 @@ void HttpServer::stop() {
     }
 
     m_tcpServer.reset();
+
+    destroyTlsContext();
 
     LOG_INFO("Server stopped");
 }
@@ -514,6 +924,19 @@ size_t HttpServer::getCacheMaxFileSize() const {
 }
 
 /**
+ * @brief 配置 TLS/HTTPS 选项
+ */
+void HttpServer::setTlsConfig(bool enabled,
+                              const std::string& certFile,
+                              const std::string& keyFile,
+                              const std::string& cipherSuites) {
+    m_tlsEnabled = enabled;
+    m_tlsCertFile = certFile;
+    m_tlsKeyFile = keyFile;
+    m_tlsCipherSuites = cipherSuites;
+}
+
+/**
  * @brief 获取缓存统计信息
  *
  * @return std::string 缓存统计信息的JSON格式字符串
@@ -586,13 +1009,27 @@ bool HttpServer::matchRoutePattern(const std::string& pattern,
     return true;
 }
 
+bool HttpServer::matchRouteParams(const HttpRequest& request,
+                                  const std::map<std::string, std::string>& requiredParams) const {
+    for (const auto& requiredParam : requiredParams) {
+        if (request.getParameter(requiredParam.first) != requiredParam.second) {
+            return false;
+        }
+    }
+
+    return true;
+}
+
 std::string HttpServer::getAllowedMethodsForPath(const std::string& path) const {
     std::vector<std::string> methods;
     for (const auto& pair : m_routeHandlers) {
         const std::string suffix = " " + path;
         if (pair.first.size() > suffix.size() &&
             pair.first.compare(pair.first.size() - suffix.size(), suffix.size(), suffix) == 0) {
-            methods.push_back(pair.first.substr(0, pair.first.size() - suffix.size()));
+            const std::string method = pair.first.substr(0, pair.first.size() - suffix.size());
+            for (size_t index = 0; index < pair.second.size(); ++index) {
+                methods.push_back(method);
+            }
         }
     }
 
@@ -628,12 +1065,18 @@ std::string HttpServer::getAllowedMethodsForPath(const std::string& path) const 
     return allow.str();
 }
 
-void HttpServer::registerRoute(HttpRequest::Method method, const std::string& path, RequestHandler handler) {
-    m_routeHandlers[buildRouteKey(method, path)] = std::move(handler);
+void HttpServer::registerRoute(HttpRequest::Method method,
+                               const std::string& path,
+                               RequestHandler handler,
+                               const std::map<std::string, std::string>& requiredParams) {
+    m_routeHandlers[buildRouteKey(method, path)].push_back({std::move(handler), requiredParams});
 }
 
-void HttpServer::registerRoutePattern(HttpRequest::Method method, const std::string& pathPattern, RequestHandler handler) {
-    m_routePatterns.push_back({method, pathPattern, std::move(handler)});
+void HttpServer::registerRoutePattern(HttpRequest::Method method,
+                                      const std::string& pathPattern,
+                                      RequestHandler handler,
+                                      const std::map<std::string, std::string>& requiredParams) {
+    m_routePatterns.push_back({method, pathPattern, std::move(handler), requiredParams});
 }
 
 void HttpServer::registerDefaultRoutes() {
@@ -668,28 +1111,66 @@ void HttpServer::registerDefaultRoutes() {
 bool HttpServer::dispatchRoute(const HttpRequest& request, HttpResponse& response) const {
     const std::string routeKey = buildRouteKey(request.getMethod(), request.getPath());
     const auto it = m_routeHandlers.find(routeKey);
-    if (it == m_routeHandlers.end()) {
-        for (const auto& routePattern : m_routePatterns) {
-            if (routePattern.method != request.getMethod()) {
+    if (it != m_routeHandlers.end()) {
+        size_t bestMatchSpecificity = 0;
+        bool matched = false;
+
+        for (const auto& routeEntry : it->second) {
+            if (!matchRouteParams(request, routeEntry.requiredParams)) {
                 continue;
             }
 
-            std::map<std::string, std::string> pathParams;
-            if (!matchRoutePattern(routePattern.pattern, request.getPath(), pathParams)) {
+            const size_t specificity = routeEntry.requiredParams.size();
+            if (matched && specificity <= bestMatchSpecificity) {
                 continue;
             }
 
-            HttpRequest routedRequest = request;
-            routedRequest.setPathParams(pathParams);
-            response = routePattern.handler(routedRequest);
-            return true;
+            response = routeEntry.handler(request);
+            bestMatchSpecificity = specificity;
+            matched = true;
         }
 
-        return false;
+        if (matched) {
+            return true;
+        }
     }
 
-    response = it->second(request);
-    return true;
+    size_t bestMatchSpecificity = 0;
+    bool matched = false;
+    HttpResponse bestResponse;
+
+    for (const auto& routePattern : m_routePatterns) {
+        if (routePattern.method != request.getMethod()) {
+            continue;
+        }
+
+        std::map<std::string, std::string> pathParams;
+        if (!matchRoutePattern(routePattern.pattern, request.getPath(), pathParams)) {
+            continue;
+        }
+
+        if (!matchRouteParams(request, routePattern.requiredParams)) {
+            continue;
+        }
+
+        HttpRequest routedRequest = request;
+        routedRequest.setPathParams(pathParams);
+        const size_t specificity = routePattern.requiredParams.size();
+        if (matched && specificity <= bestMatchSpecificity) {
+            continue;
+        }
+
+        bestResponse = routePattern.handler(routedRequest);
+        bestMatchSpecificity = specificity;
+        matched = true;
+    }
+
+    if (matched) {
+        response = std::move(bestResponse);
+        return true;
+    }
+
+    return false;
 }
 
 void HttpServer::runMiddlewareChain(size_t index,
@@ -723,7 +1204,8 @@ void HttpServer::processRequest(HttpRequest& request, HttpResponse& response) co
             generatedResponse.setStatusCode(HttpResponse::STATUS_204_NO_CONTENT);
             generatedResponse.addHeader("Allow", getAllowedMethodsForPath(request.getPath()));
             generatedResponse.setBody("");
-        } else if (request.getMethod() == HttpRequest::METHOD_PUT ||
+        } else if (request.getMethod() == HttpRequest::METHOD_PATCH ||
+               request.getMethod() == HttpRequest::METHOD_PUT ||
                    request.getMethod() == HttpRequest::METHOD_DELETE) {
             generatedResponse = buildUnifiedErrorResponse(request,
                                                           HttpResponse::STATUS_405_METHOD_NOT_ALLOWED,
@@ -845,14 +1327,37 @@ std::string HttpServer::getLocalIp() const {
 void HttpServer::handleClientAccepted(int clientSocket, const std::string& clientIp, int clientPort) {
     LOG_INFO("Client connected: " + clientIp + ":" + std::to_string(clientPort));
 
+    std::shared_ptr<SSL> tlsSession;
+    if (m_tlsEnabled) {
+        tlsSession = createTlsSession(clientSocket);
+        if (!tlsSession) {
+            clearSocketReadBuffer(clientSocket);
+            close(clientSocket);
+            return;
+        }
+    }
+
+    ClientInfo clientInfo{clientIp, clientPort, "", tlsSession};
+
     if (!m_useEpoll) {
         if (!m_threadPool) {
             close(clientSocket);
             return;
         }
 
-        m_threadPool->enqueue([this, clientSocket, clientIp, clientPort]() {
-            handleClient(clientSocket, clientIp, clientPort);
+        m_threadPool->enqueue([this, clientSocket, clientInfo]() mutable {
+            while (this->m_running.load()) {
+                bool keepAlive = this->handleClient(clientSocket,
+                                                    clientInfo.ip,
+                                                    clientInfo.port,
+                                                    clientInfo.tlsSession.get());
+                if (!keepAlive) {
+                    break;
+                }
+            }
+
+            clearSocketReadBuffer(clientSocket);
+            close(clientSocket);
         });
         return;
     }
@@ -879,7 +1384,7 @@ void HttpServer::handleClientAccepted(int clientSocket, const std::string& clien
 
     {
         std::lock_guard<std::mutex> lock(m_clientInfoMutex);
-        m_clientInfoMap[clientSocket] = {clientIp, clientPort, ""};
+        m_clientInfoMap[clientSocket] = std::move(clientInfo);
     }
 
     auto clientCallback = [this](int fd, uint32_t ev) {
@@ -945,7 +1450,10 @@ void HttpServer::handleClientRead(int clientSocket, uint32_t events) {
     // 将请求处理提交到线程池
     m_threadPool->enqueue([this, clientSocket, clientInfo]() {
         // 在线程池中处理请求
-        bool keepAlive = this->handleClient(clientSocket, clientInfo.ip, clientInfo.port);
+        bool keepAlive = this->handleClient(clientSocket,
+                            clientInfo.ip,
+                            clientInfo.port,
+                            clientInfo.tlsSession.get());
 
         if (keepAlive) {
             // Keep-Alive：重新注册到epoll，等待下一个请求
@@ -1010,18 +1518,48 @@ void HttpServer::cleanupClient(int clientSocket) {
 /**
  * @brief 处理客户端请求
  *
- * 完整的请求处理流程：
- * 1. 解析HTTP请求
- * 2. 调用处理函数生成响应
- * 3. 发送响应头
- * 4. 发送响应体（文件或内存内容）
+ * 根据请求路径查找对应的文件，并生成HTTP响应。
+ * 该流程负责静态资源的完整协商与回退，包括：
+ * - 路径遍历检查与 URL 解码后的二次校验
+ * - 目录请求自动解析 index.html
+ * - 目录无索引页时返回目录列表
+ * - 生成 ETag 和 Last-Modified，用于缓存验证
+ * - 处理 If-None-Match / If-Modified-Since 并返回 304
+ * - 支持单段 Range 请求并返回 206 / 416
+ *
+ * 这是静态文件链路的核心入口，既承担资源发现，也承担协议协商。
  * 5. 关闭客户端连接
  *
  * @param clientSocket 客户端socket描述符
  * @param clientIp 客户端IP地址
  * @param clientPort 客户端端口号
  */
-bool HttpServer::handleClient(int clientSocket, const std::string& clientIp, int clientPort) {
+bool HttpServer::handleClient(int clientSocket,
+                              const std::string& clientIp,
+                              int clientPort,
+                              SSL* ssl) {
+    if (ssl && !SSL_is_init_finished(ssl)) {
+        while (true) {
+            int acceptResult = SSL_accept(ssl);
+            if (acceptResult == 1) {
+                break;
+            }
+
+            int sslError = SSL_get_error(ssl, acceptResult);
+            if (sslError == SSL_ERROR_WANT_READ || sslError == SSL_ERROR_WANT_WRITE) {
+                continue;
+            }
+
+            if (sslError == SSL_ERROR_ZERO_RETURN) {
+                LOG_INFO("TLS client closed during handshake: " + clientIp + ":" + std::to_string(clientPort));
+                return false;
+            }
+
+            LOG_ERROR("TLS handshake failed for " + clientIp + ":" + std::to_string(clientPort) + ": " + getOpenSslErrorMessage());
+            return false;
+        }
+    }
+
     // 记录请求开始时间
     auto startTime = std::chrono::steady_clock::now();
 
@@ -1037,7 +1575,7 @@ bool HttpServer::handleClient(int clientSocket, const std::string& clientIp, int
 
     try {
         // 步骤1：解析HTTP请求
-        request = parseRequest(clientSocket);
+        request = parseRequest(clientSocket, ssl);
 
         // 检查请求是否有效（如果解析失败，request会是默认构造的无效对象）
         if (request.getUrl().empty()) {
@@ -1214,13 +1752,45 @@ bool HttpServer::handleClient(int clientSocket, const std::string& clientIp, int
 
     // 步骤5：发送HTTP响应
     std::string headerStr = response.buildHeaderString(responseSize);
-    if (sendData(clientSocket, headerStr.c_str(), headerStr.size()) <= 0) {
+    if (sendData(clientSocket, headerStr.c_str(), headerStr.size(), ssl) <= 0) {
         keepAlive = false;  // 发送失败，关闭连接
     }
 
-    const bool shouldSendBody = !(parseSuccess && request.getMethod() == HttpRequest::METHOD_HEAD);
+    const bool shouldSendBody = !(parseSuccess &&
+                                  (request.getMethod() == HttpRequest::METHOD_HEAD ||
+                                   response.getStatusCode() == HttpResponse::STATUS_204_NO_CONTENT ||
+                                   response.getStatusCode() == HttpResponse::STATUS_304_NOT_MODIFIED));
 
-    if (shouldSendBody && useSendfile && fileFd >= 0) {
+    if (shouldSendBody && ssl && fileFd >= 0) {
+        if (lseek(fileFd, fileOffset, SEEK_SET) < 0) {
+            keepAlive = false;
+        } else {
+            char buffer[8192];
+            size_t remaining = fileSize;
+            while (remaining > 0) {
+                size_t chunkSize = std::min(remaining, sizeof(buffer));
+                ssize_t bytesRead = read(fileFd, buffer, chunkSize);
+                if (bytesRead < 0) {
+                    if (errno == EINTR) {
+                        continue;
+                    }
+                    keepAlive = false;
+                    break;
+                }
+                if (bytesRead == 0) {
+                    break;
+                }
+
+                if (sendData(clientSocket, buffer, static_cast<size_t>(bytesRead), ssl) <= 0) {
+                    keepAlive = false;
+                    break;
+                }
+
+                remaining -= static_cast<size_t>(bytesRead);
+            }
+        }
+        close(fileFd);
+    } else if (shouldSendBody && useSendfile && fileFd >= 0) {
         // 使用sendfile零拷贝发送文件内容，性能更优
         ssize_t sent;
         while (fileSize > 0) {
@@ -1277,7 +1847,7 @@ bool HttpServer::handleClient(int clientSocket, const std::string& clientIp, int
  * @param clientSocket 客户端socket
  * @return HttpRequest 解析后的请求对象
  */
-HttpRequest HttpServer::parseRequest(int clientSocket) const {
+HttpRequest HttpServer::parseRequest(int clientSocket, SSL* ssl) const {
     HttpRequest request;
     std::string line;
 
@@ -1285,7 +1855,7 @@ HttpRequest HttpServer::parseRequest(int clientSocket) const {
     // epoll 水平触发（LT）模式已确保数据就绪才调用此函数，无需再用 select() 二次确认
 
     // 读取请求行（第一行）
-    if (readLine(clientSocket, line) <= 0) {
+    if (readLine(clientSocket, line, ssl) <= 0) {
         // 如果请求行读取失败，返回空的请求对象
         // 这会导致后续处理返回400错误，而不是默认构造的无效请求
         return HttpRequest();
@@ -1312,7 +1882,7 @@ HttpRequest HttpServer::parseRequest(int clientSocket) const {
     request.setVersion(version);
 
     // 读取HTTP头部
-    while (readLine(clientSocket, line) > 0) {
+    while (readLine(clientSocket, line, ssl) > 0) {
         // 空行表示头部结束
         if (line.empty()) {
             break;
@@ -1342,7 +1912,7 @@ HttpRequest HttpServer::parseRequest(int clientSocket) const {
         if (contentLength > 0 && contentLength <= 10 * 1024 * 1024) {
             std::string body;
             body.resize(contentLength);
-            readData(clientSocket, &body[0], contentLength);
+            readData(clientSocket, &body[0], contentLength, ssl);
             request.setBody(body);
         }
     }
@@ -1402,10 +1972,29 @@ HttpResponse HttpServer::handleStaticFile(const HttpRequest& request) const {
         }
     }
 
+    if (!S_ISREG(st.st_mode)) {
+        return HttpResponse::notFound();
+    }
+
+    const std::string etag = buildStaticFileEtag(st);
+    const std::string lastModified = formatHttpDate(st.st_mtime);
+
+    if (isConditionalNotModified(request, st, etag)) {
+        HttpResponse response;
+        response.setStatusCode(HttpResponse::STATUS_304_NOT_MODIFIED);
+        response.addHeader("ETag", etag);
+        response.addHeader("Last-Modified", lastModified);
+        response.addHeader("Accept-Ranges", "bytes");
+        return response;
+    }
+
     // 创建成功响应
     HttpResponse response;
     response.setStatusCode(HttpResponse::STATUS_200_OK);
     response.setFilePath(filePath);  // 设置文件路径，响应类会自动识别Content-Type
+    response.addHeader("ETag", etag);
+    response.addHeader("Last-Modified", lastModified);
+    response.addHeader("Accept-Ranges", "bytes");
 
     return response;
 }
@@ -1559,7 +2148,7 @@ bool HttpServer::isPathTraversal(const std::string& path) const {
  * @param line 存储读取结果的字符串
  * @return int 读取的字节数，-1表示错误或连接关闭
  */
-int HttpServer::readLine(int socket, std::string& line) const {
+int HttpServer::readLine(int socket, std::string& line, SSL* ssl) const {
     line.clear();
 
     // 先消费已有缓冲，再按块读取并持续尝试切行
@@ -1586,8 +2175,29 @@ int HttpServer::readLine(int socket, std::string& line) const {
         }
 
         char chunk[4096];
-        ssize_t n = read(socket, chunk, sizeof(chunk));
+        ssize_t n = ssl ? SSL_read(ssl, chunk, sizeof(chunk)) : read(socket, chunk, sizeof(chunk));
         if (n < 0) {
+            if (ssl) {
+                int sslError = SSL_get_error(ssl, static_cast<int>(n));
+                if (sslError == SSL_ERROR_WANT_READ || sslError == SSL_ERROR_WANT_WRITE) {
+                    continue;
+                }
+
+                if (sslError == SSL_ERROR_ZERO_RETURN) {
+                    std::lock_guard<std::mutex> lock(g_readBufferMutex);
+                    auto it = g_socketReadBuffers.find(socket);
+                    if (it != g_socketReadBuffers.end() && !it->second.empty()) {
+                        line = it->second;
+                        if (!line.empty() && line.back() == '\r') {
+                            line.pop_back();
+                        }
+                        g_socketReadBuffers.erase(it);
+                        return static_cast<int>(line.length());
+                    }
+                    return -1;
+                }
+            }
+
             if (errno == EINTR) {
                 continue;
             }
@@ -1655,14 +2265,22 @@ int HttpServer::readLine(int socket, std::string& line) const {
  * @param size 要读取的字节数
  * @return ssize_t 实际读取的字节数
  */
-ssize_t HttpServer::readData(int socket, char* buffer, size_t size) const {
+ssize_t HttpServer::readData(int socket, char* buffer, size_t size, SSL* ssl) const {
     size_t totalRead = 0;
     ssize_t n;
 
     // 循环读取直到达到指定数量
     while (totalRead < size) {
-        n = read(socket, buffer + totalRead, size - totalRead);
+        n = ssl ? SSL_read(ssl, buffer + totalRead, static_cast<int>(size - totalRead))
+                : read(socket, buffer + totalRead, size - totalRead);
         if (n < 0) {
+            if (ssl) {
+                int sslError = SSL_get_error(ssl, static_cast<int>(n));
+                if (sslError == SSL_ERROR_WANT_READ || sslError == SSL_ERROR_WANT_WRITE) {
+                    continue;
+                }
+            }
+
             // 非阻塞模式下，EAGAIN表示数据已读完
             if (errno == EAGAIN || errno == EWOULDBLOCK) {
                 break;
@@ -1691,15 +2309,23 @@ ssize_t HttpServer::readData(int socket, char* buffer, size_t size) const {
  * @param size 要发送的字节数
  * @return ssize_t 实际发送的字节数
  */
-ssize_t HttpServer::sendData(int socket, const char* data, size_t size) const {
+ssize_t HttpServer::sendData(int socket, const char* data, size_t size, SSL* ssl) const {
     size_t totalSent = 0;
     ssize_t n;
 
     // 循环发送直到全部发送完成
     while (totalSent < size) {
-        n = write(socket, data + totalSent, size - totalSent);
+        n = ssl ? SSL_write(ssl, data + totalSent, static_cast<int>(size - totalSent))
+                : write(socket, data + totalSent, size - totalSent);
         
         if (n <= 0) {
+            if (ssl) {
+                int sslError = SSL_get_error(ssl, static_cast<int>(n));
+                if (sslError == SSL_ERROR_WANT_READ || sslError == SSL_ERROR_WANT_WRITE) {
+                    continue;
+                }
+            }
+
             // 被中断信号打断，继续尝试
             if (errno == EINTR) {
                 continue;
