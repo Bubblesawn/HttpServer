@@ -39,6 +39,8 @@
 #include <unordered_map>     // socket读取缓冲
 #include <vector>
 
+#include <openssl/err.h>
+
 #include <nlohmann/json.hpp>
 
 // 为兼容旧版本系统，定义EPOLLRDHUP（如果未定义）
@@ -62,6 +64,31 @@ std::mutex g_readBufferMutex;
  * 保存在这里，下一次读取同一连接时继续拼接解析。
  */
 std::unordered_map<int, std::string> g_socketReadBuffers;
+
+/**
+ * @brief 初始化 OpenSSL 全局状态，仅执行一次。
+ */
+std::once_flag g_openSslInitOnce;
+
+void initializeOpenSsl() {
+    std::call_once(g_openSslInitOnce, []() {
+        OPENSSL_init_ssl(0, nullptr);
+    });
+}
+
+/**
+ * @brief 获取 OpenSSL 错误栈的字符串表示。
+ */
+std::string getOpenSslErrorMessage() {
+    unsigned long errorCode = ERR_get_error();
+    if (errorCode == 0) {
+        return "unknown OpenSSL error";
+    }
+
+    char buffer[256];
+    ERR_error_string_n(errorCode, buffer, sizeof(buffer));
+    return buffer;
+}
 
 /**
  * @brief 生成输入字符串的小写副本。
@@ -579,6 +606,10 @@ bool HttpServer::start() {
         return false;
     }
 
+    if (m_tlsEnabled && !setupTlsContext()) {
+        return false;
+    }
+
     m_threadPool = std::make_unique<ThreadPool>(m_numThreads);
     m_fileCache = std::make_unique<FileCache>();
     m_tcpServer = std::make_unique<TcpServer>(m_ip, m_port, m_useEpoll);
@@ -595,6 +626,7 @@ bool HttpServer::start() {
         }
         m_fileCache.reset();
         m_tcpServer.reset();
+        destroyTlsContext();
         m_running.store(false);
         return false;
     }
@@ -604,9 +636,111 @@ bool HttpServer::start() {
     LOG_INFO("Server started on " + m_ip + ":" + std::to_string(m_port));
     LOG_INFO("Document root: " + m_docRoot);
     LOG_INFO("Thread pool size: " + std::to_string(m_numThreads));
+    LOG_INFO(std::string("Transport: ") + (m_tlsEnabled ? "HTTPS" : "HTTP"));
     LOG_INFO(std::string("Mode: ") + (m_useEpoll ? "epoll + thread pool (hybrid)" : "thread pool (one-thread-per-connection)"));
 
     return true;
+}
+
+/**
+ * @brief 初始化 TLS 上下文
+ */
+bool HttpServer::setupTlsContext() {
+    if (!m_tlsEnabled) {
+        return true;
+    }
+
+    initializeOpenSsl();
+
+    destroyTlsContext();
+
+    m_tlsContext = SSL_CTX_new(TLS_server_method());
+    if (!m_tlsContext) {
+        LOG_ERROR("Failed to create TLS context: " + getOpenSslErrorMessage());
+        return false;
+    }
+
+    SSL_CTX_set_mode(m_tlsContext, SSL_MODE_AUTO_RETRY);
+    SSL_CTX_set_min_proto_version(m_tlsContext, TLS1_2_VERSION);
+    SSL_CTX_set_options(m_tlsContext, SSL_OP_NO_COMPRESSION);
+
+    if (!m_tlsCipherSuites.empty()) {
+        bool cipherConfigured = false;
+        if (SSL_CTX_set_cipher_list(m_tlsContext, m_tlsCipherSuites.c_str()) == 1) {
+            cipherConfigured = true;
+        }
+
+#if OPENSSL_VERSION_NUMBER >= 0x10101000L
+        if (SSL_CTX_set_ciphersuites(m_tlsContext, m_tlsCipherSuites.c_str()) == 1) {
+            cipherConfigured = true;
+        }
+#endif
+
+        if (!cipherConfigured) {
+            LOG_ERROR("Failed to configure TLS cipher suites: " + m_tlsCipherSuites + " (" + getOpenSslErrorMessage() + ")");
+            destroyTlsContext();
+            return false;
+        }
+    }
+
+    if (SSL_CTX_use_certificate_file(m_tlsContext, m_tlsCertFile.c_str(), SSL_FILETYPE_PEM) != 1) {
+        LOG_ERROR("Failed to load TLS certificate: " + m_tlsCertFile + " (" + getOpenSslErrorMessage() + ")");
+        destroyTlsContext();
+        return false;
+    }
+
+    if (SSL_CTX_use_PrivateKey_file(m_tlsContext, m_tlsKeyFile.c_str(), SSL_FILETYPE_PEM) != 1) {
+        LOG_ERROR("Failed to load TLS private key: " + m_tlsKeyFile + " (" + getOpenSslErrorMessage() + ")");
+        destroyTlsContext();
+        return false;
+    }
+
+    if (SSL_CTX_check_private_key(m_tlsContext) != 1) {
+        LOG_ERROR("TLS certificate and private key do not match: " + getOpenSslErrorMessage());
+        destroyTlsContext();
+        return false;
+    }
+
+    return true;
+}
+
+/**
+ * @brief 释放 TLS 上下文
+ */
+void HttpServer::destroyTlsContext() {
+    if (m_tlsContext) {
+        SSL_CTX_free(m_tlsContext);
+        m_tlsContext = nullptr;
+    }
+}
+
+/**
+ * @brief 创建单个 TLS 会话
+ */
+std::shared_ptr<SSL> HttpServer::createTlsSession(int clientSocket) const {
+    if (!m_tlsEnabled || !m_tlsContext) {
+        return nullptr;
+    }
+
+    SSL* rawSession = SSL_new(m_tlsContext);
+    if (!rawSession) {
+        LOG_ERROR("Failed to create TLS session for fd " + std::to_string(clientSocket) + ": " + getOpenSslErrorMessage());
+        return nullptr;
+    }
+
+    if (SSL_set_fd(rawSession, clientSocket) != 1) {
+        LOG_ERROR("Failed to bind TLS session to fd " + std::to_string(clientSocket) + ": " + getOpenSslErrorMessage());
+        SSL_free(rawSession);
+        return nullptr;
+    }
+
+    SSL_set_accept_state(rawSession);
+
+    return std::shared_ptr<SSL>(rawSession, [](SSL* session) {
+        if (session) {
+            SSL_free(session);
+        }
+    });
 }
 
 /**
@@ -651,6 +785,8 @@ void HttpServer::stop() {
     }
 
     m_tcpServer.reset();
+
+    destroyTlsContext();
 
     LOG_INFO("Server stopped");
 }
@@ -785,6 +921,19 @@ size_t HttpServer::getCacheMaxFileSize() const {
         return m_fileCache->getMaxFileSize();
     }
     return 0;
+}
+
+/**
+ * @brief 配置 TLS/HTTPS 选项
+ */
+void HttpServer::setTlsConfig(bool enabled,
+                              const std::string& certFile,
+                              const std::string& keyFile,
+                              const std::string& cipherSuites) {
+    m_tlsEnabled = enabled;
+    m_tlsCertFile = certFile;
+    m_tlsKeyFile = keyFile;
+    m_tlsCipherSuites = cipherSuites;
 }
 
 /**
@@ -1178,14 +1327,37 @@ std::string HttpServer::getLocalIp() const {
 void HttpServer::handleClientAccepted(int clientSocket, const std::string& clientIp, int clientPort) {
     LOG_INFO("Client connected: " + clientIp + ":" + std::to_string(clientPort));
 
+    std::shared_ptr<SSL> tlsSession;
+    if (m_tlsEnabled) {
+        tlsSession = createTlsSession(clientSocket);
+        if (!tlsSession) {
+            clearSocketReadBuffer(clientSocket);
+            close(clientSocket);
+            return;
+        }
+    }
+
+    ClientInfo clientInfo{clientIp, clientPort, "", tlsSession};
+
     if (!m_useEpoll) {
         if (!m_threadPool) {
             close(clientSocket);
             return;
         }
 
-        m_threadPool->enqueue([this, clientSocket, clientIp, clientPort]() {
-            handleClient(clientSocket, clientIp, clientPort);
+        m_threadPool->enqueue([this, clientSocket, clientInfo]() mutable {
+            while (this->m_running.load()) {
+                bool keepAlive = this->handleClient(clientSocket,
+                                                    clientInfo.ip,
+                                                    clientInfo.port,
+                                                    clientInfo.tlsSession.get());
+                if (!keepAlive) {
+                    break;
+                }
+            }
+
+            clearSocketReadBuffer(clientSocket);
+            close(clientSocket);
         });
         return;
     }
@@ -1212,7 +1384,7 @@ void HttpServer::handleClientAccepted(int clientSocket, const std::string& clien
 
     {
         std::lock_guard<std::mutex> lock(m_clientInfoMutex);
-        m_clientInfoMap[clientSocket] = {clientIp, clientPort, ""};
+        m_clientInfoMap[clientSocket] = std::move(clientInfo);
     }
 
     auto clientCallback = [this](int fd, uint32_t ev) {
@@ -1278,7 +1450,10 @@ void HttpServer::handleClientRead(int clientSocket, uint32_t events) {
     // 将请求处理提交到线程池
     m_threadPool->enqueue([this, clientSocket, clientInfo]() {
         // 在线程池中处理请求
-        bool keepAlive = this->handleClient(clientSocket, clientInfo.ip, clientInfo.port);
+        bool keepAlive = this->handleClient(clientSocket,
+                            clientInfo.ip,
+                            clientInfo.port,
+                            clientInfo.tlsSession.get());
 
         if (keepAlive) {
             // Keep-Alive：重新注册到epoll，等待下一个请求
@@ -1359,7 +1534,32 @@ void HttpServer::cleanupClient(int clientSocket) {
  * @param clientIp 客户端IP地址
  * @param clientPort 客户端端口号
  */
-bool HttpServer::handleClient(int clientSocket, const std::string& clientIp, int clientPort) {
+bool HttpServer::handleClient(int clientSocket,
+                              const std::string& clientIp,
+                              int clientPort,
+                              SSL* ssl) {
+    if (ssl && !SSL_is_init_finished(ssl)) {
+        while (true) {
+            int acceptResult = SSL_accept(ssl);
+            if (acceptResult == 1) {
+                break;
+            }
+
+            int sslError = SSL_get_error(ssl, acceptResult);
+            if (sslError == SSL_ERROR_WANT_READ || sslError == SSL_ERROR_WANT_WRITE) {
+                continue;
+            }
+
+            if (sslError == SSL_ERROR_ZERO_RETURN) {
+                LOG_INFO("TLS client closed during handshake: " + clientIp + ":" + std::to_string(clientPort));
+                return false;
+            }
+
+            LOG_ERROR("TLS handshake failed for " + clientIp + ":" + std::to_string(clientPort) + ": " + getOpenSslErrorMessage());
+            return false;
+        }
+    }
+
     // 记录请求开始时间
     auto startTime = std::chrono::steady_clock::now();
 
@@ -1375,7 +1575,7 @@ bool HttpServer::handleClient(int clientSocket, const std::string& clientIp, int
 
     try {
         // 步骤1：解析HTTP请求
-        request = parseRequest(clientSocket);
+        request = parseRequest(clientSocket, ssl);
 
         // 检查请求是否有效（如果解析失败，request会是默认构造的无效对象）
         if (request.getUrl().empty()) {
@@ -1552,7 +1752,7 @@ bool HttpServer::handleClient(int clientSocket, const std::string& clientIp, int
 
     // 步骤5：发送HTTP响应
     std::string headerStr = response.buildHeaderString(responseSize);
-    if (sendData(clientSocket, headerStr.c_str(), headerStr.size()) <= 0) {
+    if (sendData(clientSocket, headerStr.c_str(), headerStr.size(), ssl) <= 0) {
         keepAlive = false;  // 发送失败，关闭连接
     }
 
@@ -1561,7 +1761,36 @@ bool HttpServer::handleClient(int clientSocket, const std::string& clientIp, int
                                    response.getStatusCode() == HttpResponse::STATUS_204_NO_CONTENT ||
                                    response.getStatusCode() == HttpResponse::STATUS_304_NOT_MODIFIED));
 
-    if (shouldSendBody && useSendfile && fileFd >= 0) {
+    if (shouldSendBody && ssl && fileFd >= 0) {
+        if (lseek(fileFd, fileOffset, SEEK_SET) < 0) {
+            keepAlive = false;
+        } else {
+            char buffer[8192];
+            size_t remaining = fileSize;
+            while (remaining > 0) {
+                size_t chunkSize = std::min(remaining, sizeof(buffer));
+                ssize_t bytesRead = read(fileFd, buffer, chunkSize);
+                if (bytesRead < 0) {
+                    if (errno == EINTR) {
+                        continue;
+                    }
+                    keepAlive = false;
+                    break;
+                }
+                if (bytesRead == 0) {
+                    break;
+                }
+
+                if (sendData(clientSocket, buffer, static_cast<size_t>(bytesRead), ssl) <= 0) {
+                    keepAlive = false;
+                    break;
+                }
+
+                remaining -= static_cast<size_t>(bytesRead);
+            }
+        }
+        close(fileFd);
+    } else if (shouldSendBody && useSendfile && fileFd >= 0) {
         // 使用sendfile零拷贝发送文件内容，性能更优
         ssize_t sent;
         while (fileSize > 0) {
@@ -1618,7 +1847,7 @@ bool HttpServer::handleClient(int clientSocket, const std::string& clientIp, int
  * @param clientSocket 客户端socket
  * @return HttpRequest 解析后的请求对象
  */
-HttpRequest HttpServer::parseRequest(int clientSocket) const {
+HttpRequest HttpServer::parseRequest(int clientSocket, SSL* ssl) const {
     HttpRequest request;
     std::string line;
 
@@ -1626,7 +1855,7 @@ HttpRequest HttpServer::parseRequest(int clientSocket) const {
     // epoll 水平触发（LT）模式已确保数据就绪才调用此函数，无需再用 select() 二次确认
 
     // 读取请求行（第一行）
-    if (readLine(clientSocket, line) <= 0) {
+    if (readLine(clientSocket, line, ssl) <= 0) {
         // 如果请求行读取失败，返回空的请求对象
         // 这会导致后续处理返回400错误，而不是默认构造的无效请求
         return HttpRequest();
@@ -1653,7 +1882,7 @@ HttpRequest HttpServer::parseRequest(int clientSocket) const {
     request.setVersion(version);
 
     // 读取HTTP头部
-    while (readLine(clientSocket, line) > 0) {
+    while (readLine(clientSocket, line, ssl) > 0) {
         // 空行表示头部结束
         if (line.empty()) {
             break;
@@ -1683,7 +1912,7 @@ HttpRequest HttpServer::parseRequest(int clientSocket) const {
         if (contentLength > 0 && contentLength <= 10 * 1024 * 1024) {
             std::string body;
             body.resize(contentLength);
-            readData(clientSocket, &body[0], contentLength);
+            readData(clientSocket, &body[0], contentLength, ssl);
             request.setBody(body);
         }
     }
@@ -1919,7 +2148,7 @@ bool HttpServer::isPathTraversal(const std::string& path) const {
  * @param line 存储读取结果的字符串
  * @return int 读取的字节数，-1表示错误或连接关闭
  */
-int HttpServer::readLine(int socket, std::string& line) const {
+int HttpServer::readLine(int socket, std::string& line, SSL* ssl) const {
     line.clear();
 
     // 先消费已有缓冲，再按块读取并持续尝试切行
@@ -1946,8 +2175,29 @@ int HttpServer::readLine(int socket, std::string& line) const {
         }
 
         char chunk[4096];
-        ssize_t n = read(socket, chunk, sizeof(chunk));
+        ssize_t n = ssl ? SSL_read(ssl, chunk, sizeof(chunk)) : read(socket, chunk, sizeof(chunk));
         if (n < 0) {
+            if (ssl) {
+                int sslError = SSL_get_error(ssl, static_cast<int>(n));
+                if (sslError == SSL_ERROR_WANT_READ || sslError == SSL_ERROR_WANT_WRITE) {
+                    continue;
+                }
+
+                if (sslError == SSL_ERROR_ZERO_RETURN) {
+                    std::lock_guard<std::mutex> lock(g_readBufferMutex);
+                    auto it = g_socketReadBuffers.find(socket);
+                    if (it != g_socketReadBuffers.end() && !it->second.empty()) {
+                        line = it->second;
+                        if (!line.empty() && line.back() == '\r') {
+                            line.pop_back();
+                        }
+                        g_socketReadBuffers.erase(it);
+                        return static_cast<int>(line.length());
+                    }
+                    return -1;
+                }
+            }
+
             if (errno == EINTR) {
                 continue;
             }
@@ -2015,14 +2265,22 @@ int HttpServer::readLine(int socket, std::string& line) const {
  * @param size 要读取的字节数
  * @return ssize_t 实际读取的字节数
  */
-ssize_t HttpServer::readData(int socket, char* buffer, size_t size) const {
+ssize_t HttpServer::readData(int socket, char* buffer, size_t size, SSL* ssl) const {
     size_t totalRead = 0;
     ssize_t n;
 
     // 循环读取直到达到指定数量
     while (totalRead < size) {
-        n = read(socket, buffer + totalRead, size - totalRead);
+        n = ssl ? SSL_read(ssl, buffer + totalRead, static_cast<int>(size - totalRead))
+                : read(socket, buffer + totalRead, size - totalRead);
         if (n < 0) {
+            if (ssl) {
+                int sslError = SSL_get_error(ssl, static_cast<int>(n));
+                if (sslError == SSL_ERROR_WANT_READ || sslError == SSL_ERROR_WANT_WRITE) {
+                    continue;
+                }
+            }
+
             // 非阻塞模式下，EAGAIN表示数据已读完
             if (errno == EAGAIN || errno == EWOULDBLOCK) {
                 break;
@@ -2051,15 +2309,23 @@ ssize_t HttpServer::readData(int socket, char* buffer, size_t size) const {
  * @param size 要发送的字节数
  * @return ssize_t 实际发送的字节数
  */
-ssize_t HttpServer::sendData(int socket, const char* data, size_t size) const {
+ssize_t HttpServer::sendData(int socket, const char* data, size_t size, SSL* ssl) const {
     size_t totalSent = 0;
     ssize_t n;
 
     // 循环发送直到全部发送完成
     while (totalSent < size) {
-        n = write(socket, data + totalSent, size - totalSent);
+        n = ssl ? SSL_write(ssl, data + totalSent, static_cast<int>(size - totalSent))
+                : write(socket, data + totalSent, size - totalSent);
         
         if (n <= 0) {
+            if (ssl) {
+                int sslError = SSL_get_error(ssl, static_cast<int>(n));
+                if (sslError == SSL_ERROR_WANT_READ || sslError == SSL_ERROR_WANT_WRITE) {
+                    continue;
+                }
+            }
+
             // 被中断信号打断，继续尝试
             if (errno == EINTR) {
                 continue;

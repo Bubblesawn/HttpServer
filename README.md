@@ -11,6 +11,7 @@
 - 支持目录访问时的文件列表展示
 - 支持 GET/POST 基础请求处理
 - 可通过配置文件与命令行参数进行运行时配置
+- 支持可选 HTTPS/TLS，包含证书、私钥和密码套件配置
 - 支持信号优雅退出（`SIGINT`/`SIGTERM`）
 
 ## 项目结构
@@ -152,8 +153,14 @@ log_to_console 0
 - `doc_root`：静态文件根目录
 - `debug`：调试模式（1 开启，0 关闭）
 - `log_to_console`：日志是否输出到控制台（1 是，0 否）
+- `enable_tls`：是否启用 TLS/HTTPS（1 开启，0 关闭）
+- `tls_cert_file`：TLS 证书文件路径
+- `tls_key_file`：TLS 私钥文件路径
+- `tls_cipher_suites`：TLS 密码套件列表
 
 优先级：命令行参数 > 配置文件 > 默认值。
+
+说明：TLS 相关路径会按配置文件所在目录解析，便于和配置一起部署。
 
 ## 命令行参数
 
@@ -167,6 +174,10 @@ log_to_console 0
 - `-p, --port PORT`：指定端口
 - `-d, --doc-root DIR`：指定静态目录
 - `-t, --threads NUM`：指定线程数
+- `-S, --tls`：启用 TLS/HTTPS
+- `-C, --tls-cert FILE`：指定 TLS 证书文件
+- `-K, --tls-key FILE`：指定 TLS 私钥文件
+- `-Y, --tls-ciphers LIST`：指定 TLS 密码套件列表
 - `-h, --help`：查看帮助
 - `-v, --version`：查看版本
 
@@ -177,6 +188,12 @@ log_to_console 0
 ```bash
 curl -i http://127.0.0.1:8080/
 curl -i http://127.0.0.1:8080/index.html
+```
+
+如果启用了 TLS，可以使用 `https` 和 `-k` 验证自签名证书：
+
+```bash
+curl -k -i https://127.0.0.1:8080/
 ```
 
 ## 压测
