@@ -23,7 +23,7 @@ jobs:
         run: |
           sudo apt-get install -y clang-format
           # 检查当前目录下所有 .cpp 和 .h 文件
-          find . -name "*.cpp" -o -name "*.h" | xargs clang-format --dry-run --Werror
+          find . -name "*.cpp" -o -name "*.h" | xargs clang-format --dry-run --Werror --diff
 
       # 步骤3: 安装环境依赖 (以 CMake 和 GTest 为例)
       - name: Install Dependencies
