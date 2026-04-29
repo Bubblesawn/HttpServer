@@ -9,14 +9,14 @@
 #ifndef LOGGER_H
 #define LOGGER_H
 
-#include <string>
-#include <fstream>
-#include <mutex>
-#include <memory>
 #include <chrono>
+#include <fstream>
 #include <iomanip>
-#include <sstream>
 #include <iostream>
+#include <memory>
+#include <mutex>
+#include <sstream>
+#include <string>
 
 /**
  * @brief 日志级别枚举
@@ -24,10 +24,10 @@
  * 定义日志的严重程度级别，从DEBUG到ERROR递增
  */
 enum class LogLevel {
-    DEBUG = 0,  /**< 调试信息，最详细 */
-    INFO = 1,   /**< 一般信息 */
-    WARN = 2,   /**< 警告信息 */
-    ERROR = 3   /**< 错误信息 */
+  DEBUG = 0, /**< 调试信息，最详细 */
+  INFO = 1,  /**< 一般信息 */
+  WARN = 2,  /**< 警告信息 */
+  ERROR = 3  /**< 错误信息 */
 };
 
 /**
@@ -44,162 +44,159 @@ enum class LogLevel {
  */
 class Logger {
 public:
-    /**
-     * @brief 获取Logger单例实例
-     *
-     * @return Logger& 日志器实例引用
-     */
-    static Logger& getInstance();
+  /**
+   * @brief 获取Logger单例实例
+   *
+   * @return Logger& 日志器实例引用
+   */
+  static Logger &getInstance();
 
-    /**
-     * @brief 初始化日志系统
-     *
-     * @param accessLogPath 访问日志文件路径
-     * @param errorLogPath 错误日志文件路径
-     * @param minLevel 最低日志级别，低于此级别的日志不会记录
-     * @param consoleOutput 是否同时输出到控制台
-     * @return bool 初始化成功返回true
-     */
-    bool init(const std::string& accessLogPath = "./logs/access.log",
-              const std::string& errorLogPath = "./logs/error.log",
-              LogLevel minLevel = LogLevel::INFO,
-              bool consoleOutput = true);
+  /**
+   * @brief 初始化日志系统
+   *
+   * @param accessLogPath 访问日志文件路径
+   * @param errorLogPath 错误日志文件路径
+   * @param minLevel 最低日志级别，低于此级别的日志不会记录
+   * @param consoleOutput 是否同时输出到控制台
+   * @return bool 初始化成功返回true
+   */
+  bool init(const std::string &accessLogPath = "./logs/access.log",
+            const std::string &errorLogPath = "./logs/error.log",
+            LogLevel minLevel = LogLevel::INFO, bool consoleOutput = true);
 
-    /**
-     * @brief 关闭日志系统
-     *
-     * 关闭所有日志文件句柄，释放资源
-     */
-    void shutdown();
+  /**
+   * @brief 关闭日志系统
+   *
+   * 关闭所有日志文件句柄，释放资源
+   */
+  void shutdown();
 
-    /**
-     * @brief 设置最低日志级别
-     *
-     * @param level 最低日志级别
-     */
-    void setMinLevel(LogLevel level);
+  /**
+   * @brief 设置最低日志级别
+   *
+   * @param level 最低日志级别
+   */
+  void setMinLevel(LogLevel level);
 
-    /**
-     * @brief 设置是否输出到控制台
-     *
-     * @param enabled true输出，false关闭
-     */
-    void setConsoleOutput(bool enabled);
+  /**
+   * @brief 设置是否输出到控制台
+   *
+   * @param enabled true输出，false关闭
+   */
+  void setConsoleOutput(bool enabled);
 
-    /**
-     * @brief 记录DEBUG级别日志
-     *
-     * @param message 日志消息
-     */
-    void debug(const std::string& message);
+  /**
+   * @brief 记录DEBUG级别日志
+   *
+   * @param message 日志消息
+   */
+  void debug(const std::string &message);
 
-    /**
-     * @brief 记录INFO级别日志
-     *
-     * @param message 日志消息
-     */
-    void info(const std::string& message);
+  /**
+   * @brief 记录INFO级别日志
+   *
+   * @param message 日志消息
+   */
+  void info(const std::string &message);
 
-    /**
-     * @brief 记录WARN级别日志
-     *
-     * @param message 日志消息
-     */
-    void warn(const std::string& message);
+  /**
+   * @brief 记录WARN级别日志
+   *
+   * @param message 日志消息
+   */
+  void warn(const std::string &message);
 
-    /**
-     * @brief 记录ERROR级别日志
-     *
-     * @param message 日志消息
-     */
-    void error(const std::string& message);
+  /**
+   * @brief 记录ERROR级别日志
+   *
+   * @param message 日志消息
+   */
+  void error(const std::string &message);
 
-    /**
-     * @brief 记录访问日志
-     *
-     * 专门用于记录HTTP访问信息，格式统一
-     *
-     * @param clientIp 客户端IP地址
-     * @param method HTTP方法
-     * @param url 请求URL
-     * @param statusCode HTTP状态码
-     * @param responseSize 响应体大小（字节）
-     * @param durationMs 处理耗时（毫秒）
-     */
-    void access(const std::string& clientIp,
-                const std::string& method,
-                const std::string& url,
-                int statusCode,
-                size_t responseSize,
-                double durationMs);
+  /**
+   * @brief 记录访问日志
+   *
+   * 专门用于记录HTTP访问信息，格式统一
+   *
+   * @param clientIp 客户端IP地址
+   * @param method HTTP方法
+   * @param url 请求URL
+   * @param statusCode HTTP状态码
+   * @param responseSize 响应体大小（字节）
+   * @param durationMs 处理耗时（毫秒）
+   */
+  void access(const std::string &clientIp, const std::string &method,
+              const std::string &url, int statusCode, size_t responseSize,
+              double durationMs);
 
-    /**
-     * @brief 将日志级别转换为字符串
-     *
-     * @param level 日志级别
-     * @return std::string 级别字符串（DEBUG/INFO/WARN/ERROR）
-     */
-    static std::string levelToString(LogLevel level);
+  /**
+   * @brief 将日志级别转换为字符串
+   *
+   * @param level 日志级别
+   * @return std::string 级别字符串（DEBUG/INFO/WARN/ERROR）
+   */
+  static std::string levelToString(LogLevel level);
 
 private:
-    /**
-     * @brief 私有构造函数（单例模式）
-     */
-    Logger() = default;
+  /**
+   * @brief 私有构造函数（单例模式）
+   */
+  Logger() = default;
 
-    /**
-     * @brief 析构函数
-     */
-    ~Logger();
+  /**
+   * @brief 析构函数
+   */
+  ~Logger();
 
-    /**
-     * @brief 禁止拷贝构造
-     */
-    Logger(const Logger&) = delete;
+  /**
+   * @brief 禁止拷贝构造
+   */
+  Logger(const Logger &) = delete;
 
-    /**
-     * @brief 禁止赋值操作
-     */
-    Logger& operator=(const Logger&) = delete;
+  /**
+   * @brief 禁止赋值操作
+   */
+  Logger &operator=(const Logger &) = delete;
 
-    /**
-     * @brief 内部关闭函数（不加锁版本）
-     *
-     * 供init()在已持有锁的情况下调用
-     */
-    void shutdownInternal();
+  /**
+   * @brief 内部关闭函数（不加锁版本）
+   *
+   * 供init()在已持有锁的情况下调用
+   */
+  void shutdownInternal();
 
-    /**
-     * @brief 写入日志到文件
-     *
-     * @param level 日志级别
-     * @param message 日志消息
-     * @param isError 是否为错误日志（写入错误日志文件）
-     */
-    void writeLog(LogLevel level, const std::string& message, bool isError = false);
+  /**
+   * @brief 写入日志到文件
+   *
+   * @param level 日志级别
+   * @param message 日志消息
+   * @param isError 是否为错误日志（写入错误日志文件）
+   */
+  void writeLog(LogLevel level, const std::string &message,
+                bool isError = false);
 
-    /**
-     * @brief 获取当前时间字符串
-     *
-     * @return std::string 格式化的时间字符串（YYYY-MM-DD HH:MM:SS）
-     */
-    static std::string getCurrentTime();
+  /**
+   * @brief 获取当前时间字符串
+   *
+   * @return std::string 格式化的时间字符串（YYYY-MM-DD HH:MM:SS）
+   */
+  static std::string getCurrentTime();
 
-    /**
-     * @brief 确保日志目录存在
-     *
-     * @param filePath 日志文件路径
-     * @return bool 成功返回true
-     */
-    static bool ensureDirectoryExists(const std::string& filePath);
+  /**
+   * @brief 确保日志目录存在
+   *
+   * @param filePath 日志文件路径
+   * @return bool 成功返回true
+   */
+  static bool ensureDirectoryExists(const std::string &filePath);
 
-    // 成员变量
-    std::ofstream m_accessLogFile;   /**< 访问日志文件流 */
-    std::ofstream m_errorLogFile;    /**< 错误日志文件流 */
-    std::mutex m_mutex;              /**< 线程安全互斥锁 */
-    LogLevel m_minLevel = LogLevel::INFO;  /**< 最低日志级别 */
-    bool m_consoleOutput = true;     /**< 是否输出到控制台 */
-    bool m_initialized = false;      /**< 是否已初始化 */
+  // 成员变量
+  std::ofstream m_accessLogFile;        /**< 访问日志文件流 */
+  std::ofstream m_errorLogFile;         /**< 错误日志文件流 */
+  std::mutex m_mutex;                   /**< 线程安全互斥锁 */
+  LogLevel m_minLevel = LogLevel::INFO; /**< 最低日志级别 */
+  bool m_consoleOutput = true;          /**< 是否输出到控制台 */
+  bool m_initialized = false;           /**< 是否已初始化 */
 };
 
 /**
@@ -219,7 +216,7 @@ private:
 /**
  * @brief 访问日志便捷宏
  */
-#define LOG_ACCESS(ip, method, url, status, size, duration) \
-    Logger::getInstance().access(ip, method, url, status, size, duration)
+#define LOG_ACCESS(ip, method, url, status, size, duration)                    \
+  Logger::getInstance().access(ip, method, url, status, size, duration)
 
 #endif // LOGGER_H

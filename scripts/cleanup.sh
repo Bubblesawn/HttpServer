@@ -31,7 +31,7 @@ fi
 
 echo ""
 echo "=== 端口状态 ==="
-for port in 8080 8081 8082 8083 8084 8085; do
+for port in  8081 8082 8083 8084 8085; do
     status=$(ss -tan 2>/dev/null | grep ":$port " | head -1)
     if [ -n "$status" ]; then
         echo "端口 $port: $status"

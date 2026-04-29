@@ -1,0 +1,47 @@
+name: C++ CI Pipeline
+
+# 1. 什么时候触发？
+on:
+  push:
+    branches: [ "dev" ]
+  pull_request:
+    branches: [ "main" ]
+
+jobs:
+  # 定义一个名为 build 的作业
+  build:
+    # 2. 在什么环境跑？(使用最新的 Ubuntu)
+    runs-on: ubuntu-latest
+
+    steps:
+      # 步骤1: 拉取仓库代码
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      # 步骤2: 检查代码格式 (针对你常用的 Clang-Format)
+      - name: Check Code Format
+        run: |
+          sudo apt-get install -y clang-format
+          # 检查当前目录下所有 .cpp 和 .h 文件
+          for file in $(find . -name "*.cpp" -o -name "*.h"); do
+            clang-format "$file" | diff - "$file" || (echo "Format error in $file" && exit 1)
+          done
+
+      # 步骤3: 安装环境依赖 (以 CMake 和 GTest 为例)
+      - name: Install Dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake build-essential libgtest-dev
+
+      # 步骤4: 配置 CMake (生成 Makefile)
+      - name: Configure CMake
+        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+
+      # 步骤5: 编译项目
+      - name: Build Project
+        run: cmake --build build --config Release
+
+      # 步骤6: 运行测试
+      - name: Run Tests
+        working-directory: build
+        run: ctest --output-on-failure
